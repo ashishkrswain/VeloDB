@@ -26,10 +26,24 @@ pub struct BlockState {
 pub struct ClientContext {
     pub db_index: usize,
     pub block_state: Option<BlockState>,
+    pub sub_mode: bool,
+    pub subscribed_channels: Vec<Vec<u8>>,
+    pub subscribed_patterns: Vec<String>,
+    pub pubsub_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(Vec<u8>, Vec<u8>)>>,
+    pub multi_mode: bool,
+    pub multi_queue: Vec<Vec<Vec<u8>>>,
+    pub watched_keys: Vec<Vec<u8>>,
+    pub watched_versions: Vec<u64>,
 }
 
 impl ClientContext {
-    pub fn new() -> Self { Self { db_index: 0, block_state: None } }
+    pub fn new() -> Self {
+        Self {
+            db_index: 0, block_state: None, sub_mode: false,
+            subscribed_channels: vec![], subscribed_patterns: vec![], pubsub_rx: None,
+            multi_mode: false, multi_queue: vec![], watched_keys: vec![], watched_versions: vec![],
+        }
+    }
 }
 
 pub async fn handle(
@@ -43,6 +57,38 @@ pub async fn handle(
     let mut ctx = ClientContext::new();
 
     loop {
+        if ctx.sub_mode {
+            // PubSub mode: read commands OR wait for messages
+            tokio::select! {
+                _ = socket.readable() => {
+                    match socket.try_read_buf(&mut buf) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            while !buf.is_empty() {
+                                match resp::parse_command(&buf) {
+                                    Ok((remaining, args)) => {
+                                        if args.is_empty() { break; }
+                                        buf.advance(buf.len() - remaining.len());
+                                        let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+                                        let response = cmd_table.dispatch(&cmd_name, &store, &mut ctx, &args[1..]);
+                                        let resp_bytes = resp::serialize_response(&response);
+                                        socket.write_all(&resp_bytes).await?;
+                                        if !ctx.sub_mode { break; }
+                                    }
+                                    Err(nom::Err::Incomplete(_)) => break,
+                                    Err(_) => { buf.clear(); }
+                                }
+                            }
+                        }
+                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Normal mode
         socket.readable().await?;
 
         match socket.try_read_buf(&mut buf) {
@@ -56,12 +102,19 @@ pub async fn handle(
                         Ok((remaining, args)) => {
                             if args.is_empty() { break; }
                             let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
+                            if ctx.multi_mode && cmd_name != "EXEC" && cmd_name != "DISCARD" && cmd_name != "WATCH" && cmd_name != "UNWATCH" && cmd_name != "MULTI" {
+                                ctx.multi_queue.push(args.clone());
+                                let resp_bytes = resp::serialize_response(&RespValue::SimpleString("QUEUED".into()));
+                                socket.write_all(&resp_bytes).await?;
+                                buf.advance(buf.len() - remaining.len());
+                                continue;
+                            }
+
                             tracing::trace!("Command: {} with {} args", cmd_name, args.len() - 1);
                             let response = cmd_table.dispatch(&cmd_name, &store, &mut ctx, &args[1..]);
                             let consumed = buf.len() - remaining.len();
                             buf.advance(consumed);
 
-                            // AOF logging for write commands
                             if let Some(aof) = &aof_writer {
                                 if is_write_command(&cmd_name) {
                                     let aof_entry = encode_command_for_aof(&args);
@@ -69,7 +122,10 @@ pub async fn handle(
                                 }
                             }
 
-                            if let Some(block) = ctx.block_state.take() {
+                            if ctx.sub_mode {
+                                let resp_bytes = resp::serialize_response(&response);
+                                socket.write_all(&resp_bytes).await?;
+                            } else if let Some(block) = ctx.block_state.take() {
                                 let notify = Arc::new(tokio::sync::Notify::new());
                                 let id = store.block_registry.register(&block.keys, notify.clone());
 

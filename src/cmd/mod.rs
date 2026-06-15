@@ -10,6 +10,8 @@ mod hash;
 mod zset;
 mod stream;
 mod nested_hash;
+mod pubsub;
+mod transaction;
 
 use std::collections::HashMap;
 use crate::store::Store;
@@ -38,6 +40,8 @@ impl CommandTable {
         table.register(zset::COMMANDS);
         table.register(stream::COMMANDS);
         table.register(nested_hash::COMMANDS);
+        table.register(pubsub::COMMANDS);
+        table.register(transaction::COMMANDS);
         table
     }
 

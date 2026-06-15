@@ -8,6 +8,23 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Pub/Sub system**: SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH with channel and pattern matching support
+- **Transactions**: MULTI, EXEC, DISCARD, WATCH, UNWATCH with atomic execution and WATCH-based optimistic locking
+- **PubSubRegistry**: DashMap-based channel/pattern registry with mpsc channels for real-time message delivery
+- **Connection pubsub mode**: Non-blocking select loop for pubsub connections, message push via RESP format
+- **Key versioning**: Per-key version counter for WATCH/EXEC conflict detection
+- **4 new integration tests**: PUBLISH/SUBSCRIBE roundtrip, MULTI/EXEC, WATCH conflict, DISCARD
+- **New command modules**: `src/cmd/pubsub.rs` (5 commands), `src/cmd/transaction.rs` (5 commands)
+- **New Store methods**: `get_version()`, `pubsub_publish()`, `pubsub_subscribe_channel()`, `pubsub_subscribe_pattern()`
+
+### Changed
+- **ClientContext**: Added sub_mode, subscribed_channels, subscribed_patterns, pubsub_rx, multi_mode, multi_queue, watched_keys, watched_versions
+- **Entry struct**: Added `version: u64` field for transaction conflict detection
+- **Store struct**: Added `pubsub_registry: PubSubRegistry`
+- **connection::handle()**: Added pubsub mode select loop and multi-command queueing for MULTI/EXEC
+- **cmd/mod.rs**: Registered pubsub and transaction command modules
+
+### Added
 - **AOF persistence**: RESP-format append-only file logging with three fsync policies (no, everysec, always), background fsync task, and server startup replay
 - **RDB persistence**: Binary snapshot format (VELO magic, CRC64), save/load with full support for all 7 data types (String, List, Set, Hash, ZSet, Stream, NestedHash) and expiry timestamps
 - **BGSAVE**: Background RDB save via `tokio::task::spawn_blocking`, writes to temp file then atomically renames

@@ -574,7 +574,75 @@ async fn test_wrong_number_of_args() {
     assert!(String::from_utf8_lossy(&resp).contains("ERR wrong number of arguments"));
 }
 
-// ========= Persistence tests =========
+// ========= PubSub tests =========
+#[tokio::test]
+async fn test_pubsub_subscribe_publish() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut pubber = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let mut subber = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    let resp = send_cmd(&mut subber, &["SUBSCRIBE", "news"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("subscribe"));
+
+    let resp = send_cmd(&mut pubber, &["PUBLISH", "news", "hello"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains(":1"));
+}
+
+#[tokio::test]
+async fn test_multi_exec() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    send_cmd(&mut stream, &["MULTI"]).await;
+    send_cmd(&mut stream, &["SET", "a", "1"]).await;
+    send_cmd(&mut stream, &["SET", "b", "2"]).await;
+    let resp = send_cmd(&mut stream, &["EXEC"]).await;
+    let s = String::from_utf8_lossy(&resp);
+    assert!(s.contains("OK"));
+}
+
+#[tokio::test]
+async fn test_watch_exec_conflict() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut s1 = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let mut s2 = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+
+    send_cmd(&mut s1, &["SET", "k", "1"]).await;
+    send_cmd(&mut s1, &["WATCH", "k"]).await;
+    send_cmd(&mut s1, &["MULTI"]).await;
+    send_cmd(&mut s1, &["SET", "k", "2"]).await;
+    // s2 modifies watched key
+    send_cmd(&mut s2, &["SET", "k", "3"]).await;
+    let resp = send_cmd(&mut s1, &["EXEC"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("*-1"));
+}
+
+#[tokio::test]
+async fn test_discard() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    send_cmd(&mut stream, &["MULTI"]).await;
+    send_cmd(&mut stream, &["SET", "x", "1"]).await;
+    let resp = send_cmd(&mut stream, &["DISCARD"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("OK"));
+    let resp = send_cmd(&mut stream, &["GET", "x"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("$-1"));
+}
 #[tokio::test]
 async fn test_rdb_save_and_load() {
     use std::fs;

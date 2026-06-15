@@ -3,4 +3,4 @@
 
 pub(crate) mod memory;
 pub use memory::{Store, StreamEntry};
-pub(crate) use memory::{Entry, StorageValue, OrderedF64};
+pub(crate) use memory::{Entry, StorageValue};

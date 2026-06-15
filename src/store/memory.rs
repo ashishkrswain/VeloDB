@@ -62,6 +62,7 @@ impl StorageValue {
 pub(crate) struct Entry {
     pub(crate) value: StorageValue,
     pub(crate) expire_at: Option<u64>,
+    pub(crate) version: u64,
 }
 
 pub struct BlockRegistry {
@@ -106,11 +107,82 @@ impl BlockRegistry {
 pub struct Store {
     pub databases: Vec<DashMap<Vec<u8>, Entry>>,
     pub block_registry: BlockRegistry,
+    pub pubsub_registry: PubSubRegistry,
 }
+
+pub struct PubSubRegistry {
+    channels: dashmap::DashMap<Vec<u8>, Vec<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>>>,
+    patterns: dashmap::DashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>>>,
+}
+
+impl PubSubRegistry {
+    pub fn new() -> Self { Self { channels: dashmap::DashMap::new(), patterns: dashmap::DashMap::new() } }
+
+    pub fn subscribe_channel(&self, channel: &[u8], tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>) {
+        self.channels.entry(channel.to_vec()).or_default().push(tx);
+    }
+
+    pub fn unsubscribe_channel(&self, channel: &[u8]) {
+        self.channels.remove(channel);
+    }
+
+    pub fn subscribe_pattern(&self, pattern: &str, tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>) {
+        self.patterns.entry(pattern.to_string()).or_default().push(tx);
+    }
+
+    pub fn unsubscribe_pattern(&self, pattern: &str) {
+        self.patterns.remove(pattern);
+    }
+
+    pub fn publish_all(&self, channel: &[u8], message: &[u8]) -> usize {
+        let mut count = self.publish_channel(channel, message);
+        count += self.publish_patterns(channel, message);
+        count
+    }
+
+    fn publish_channel(&self, channel: &[u8], message: &[u8]) -> usize {
+        let ch = channel.to_vec();
+        let msg = message.to_vec();
+        match self.channels.get(channel) {
+            Some(senders) => {
+                let len = senders.len();
+                let mut dead = Vec::new();
+                for (i, tx) in senders.iter().enumerate() {
+                    if tx.send((ch.clone(), msg.clone())).is_err() { dead.push(i); }
+                }
+                if !dead.is_empty() {
+                    drop(senders);
+                    if let Some(mut s) = self.channels.get_mut(channel) {
+                        for &i in dead.iter().rev() { s.remove(i); }
+                    }
+                }
+                len - dead.len()
+            }
+            None => 0,
+        }
+    }
+
+    fn publish_patterns(&self, channel: &[u8], message: &[u8]) -> usize {
+        let ch_str = String::from_utf8_lossy(channel);
+        let msg = message.to_vec();
+        let mut count = 0;
+        let senders: Vec<_> = self.patterns.iter()
+            .filter(|e| simple_match(&ch_str, e.key()))
+            .flat_map(|e| e.value().clone())
+            .collect();
+        for tx in senders {
+            let _ = tx.send((channel.to_vec(), msg.clone()));
+            count += 1;
+        }
+        count
+    }
+}
+
+fn count_entries(_ch: &[u8]) -> Option<usize> { None }
 
 impl Store {
     pub fn new(num: usize) -> Self {
-        Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new() }
+        Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new(), pubsub_registry: PubSubRegistry::new() }
     }
 
     fn db(&self, idx: usize) -> Result<&DashMap<Vec<u8>, Entry>> {
@@ -148,7 +220,11 @@ impl Store {
     }
 
     pub fn set(&self, db_idx: usize, key: &[u8], value: &[u8], expire_ms: Option<u64>) -> Result<()> {
-        self.db(db_idx)?.insert(key.to_vec(), Entry { value: StorageValue::String(value.to_vec()), expire_at: expire_ms });
+        let mut entry = self.db(db_idx)?.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::String(vec![]), expire_at: None, version: 0 });
+        if let StorageValue::String(s) = &mut entry.value { *s = value.to_vec(); }
+        else { entry.value = StorageValue::String(value.to_vec()); }
+        entry.expire_at = expire_ms;
+        entry.version += 1;
         Ok(())
     }
 
@@ -228,15 +304,36 @@ impl Store {
     }
 
     pub fn set_with_entry(&self, db_idx: usize, key: Vec<u8>, value: StorageValue, expire_ms: Option<u64>) -> Result<()> {
-        self.db(db_idx)?.insert(key, Entry { value, expire_at: expire_ms });
-        Ok(())
+        match self.db(db_idx)?.get_mut(&key) {
+            Some(mut e) => { e.value = value; e.expire_at = expire_ms; e.version += 1; Ok(()) }
+            None => { self.db(db_idx)?.insert(key, Entry { value, expire_at: expire_ms, version: 0 }); Ok(()) }
+        }
+    }
+
+    pub fn get_version(&self, db_idx: usize, key: &[u8]) -> Result<u64> {
+        match self.entry(db_idx, key)? {
+            Some(e) => Ok(e.version),
+            None => Ok(0),
+        }
+    }
+
+    pub fn pubsub_publish(&self, channel: &[u8], message: &[u8]) -> usize {
+        self.pubsub_registry.publish_all(channel, message)
+    }
+
+    pub fn pubsub_subscribe_channel(&self, channel: &[u8], tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>) {
+        self.pubsub_registry.subscribe_channel(channel, tx);
+    }
+
+    pub fn pubsub_subscribe_pattern(&self, pattern: &str, tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>) {
+        self.pubsub_registry.subscribe_pattern(pattern, tx);
     }
 
     // ========= List methods =========
 
     pub fn lpush(&self, db_idx: usize, key: &[u8], values: &[Vec<u8>]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::List(VecDeque::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::List(VecDeque::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::List(list) => {
                 for v in values.iter().rev() { list.push_front(v.clone()); }
@@ -251,7 +348,7 @@ impl Store {
 
     pub fn rpush(&self, db_idx: usize, key: &[u8], values: &[Vec<u8>]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::List(VecDeque::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::List(VecDeque::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::List(list) => {
                 for v in values { list.push_back(v.clone()); }
@@ -397,7 +494,7 @@ impl Store {
 
     pub fn sadd(&self, db_idx: usize, key: &[u8], members: &[Vec<u8>]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Set(HashSet::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Set(HashSet::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::Set(set) => {
                 let mut added = 0;
@@ -551,7 +648,7 @@ impl Store {
 
     pub fn hset(&self, db_idx: usize, key: &[u8], pairs: &[(Vec<u8>, Vec<u8>)]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Hash(HashMap::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Hash(HashMap::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::Hash(map) => {
                 let mut added = 0usize;
@@ -640,7 +737,7 @@ impl Store {
 
     pub fn hincrby(&self, db_idx: usize, key: &[u8], field: &[u8], increment: i64) -> Result<i64> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Hash(HashMap::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Hash(HashMap::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::Hash(map) => {
                 let current = map.get(field).and_then(|v| String::from_utf8_lossy(v).parse::<i64>().ok()).unwrap_or(0);
@@ -656,7 +753,7 @@ impl Store {
 
     pub fn zadd(&self, db_idx: usize, key: &[u8], items: &[(f64, Vec<u8>)]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::ZSet { members: HashMap::new(), scores: BTreeMap::new() }, expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::ZSet { members: HashMap::new(), scores: BTreeMap::new() }, expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::ZSet { members, scores } => {
                 let mut added = 0usize;
@@ -806,7 +903,7 @@ impl Store {
             }
         }
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Stream { entries: VecDeque::new(), last_id_ms: 0, last_id_seq: 0 }, expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::Stream { entries: VecDeque::new(), last_id_ms: 0, last_id_seq: 0 }, expire_at: None, version: 0 });
         let generated_id = format!("{}-{}", id_ms, id_seq).into_bytes();
         match &mut entry.value {
             StorageValue::Stream { entries, last_id_ms, last_id_seq } => {
@@ -977,7 +1074,7 @@ impl Store {
 
     pub fn nhset(&self, db_idx: usize, key: &[u8], field: &[u8], subfield: &[u8], value: &[u8]) -> Result<usize> {
         let db = self.db(db_idx)?;
-        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::NestedHash(HashMap::new()), expire_at: None });
+        let mut entry = db.entry(key.to_vec()).or_insert_with(|| Entry { value: StorageValue::NestedHash(HashMap::new()), expire_at: None, version: 0 });
         match &mut entry.value {
             StorageValue::NestedHash(map) => {
                 let inner = map.entry(field.to_vec()).or_default();
