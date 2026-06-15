@@ -2,4 +2,4 @@
 // SPDX-License-Identifier: MIT
 
 mod memory;
-pub use memory::Store;
+pub use memory::{Store, StreamEntry};

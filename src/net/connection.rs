@@ -5,16 +5,31 @@ use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
 use bytes::Buf;
 use std::sync::Arc;
+use std::time::Duration;
 use crate::store::Store;
 use crate::cmd::CommandTable;
-use crate::resp;
+use crate::resp::{self, RespValue};
 use crate::config::ServerConfig;
 use crate::error::VeloDBError;
 
 const MAX_QUERY_BUFFER: usize = 1024 * 1024 * 1024;
 
-pub struct ClientContext { pub db_index: usize }
-impl ClientContext { pub fn new() -> Self { Self { db_index: 0 } } }
+pub enum PopDirection { Left, Right }
+
+pub struct BlockState {
+    pub keys: Vec<Vec<u8>>,
+    pub timeout_ms: i64,
+    pub pop_direction: PopDirection,
+}
+
+pub struct ClientContext {
+    pub db_index: usize,
+    pub block_state: Option<BlockState>,
+}
+
+impl ClientContext {
+    pub fn new() -> Self { Self { db_index: 0, block_state: None } }
+}
 
 pub async fn handle(
     mut socket: TcpStream,
@@ -41,10 +56,37 @@ pub async fn handle(
                             let cmd_name = String::from_utf8_lossy(&args[0]).to_uppercase();
                             tracing::trace!("Command: {} with {} args", cmd_name, args.len() - 1);
                             let response = cmd_table.dispatch(&cmd_name, &store, &mut ctx, &args[1..]);
-                            let resp_bytes = resp::serialize_response(&response);
-                            socket.write_all(&resp_bytes).await?;
                             let consumed = buf.len() - remaining.len();
                             buf.advance(consumed);
+
+                            if let Some(block) = ctx.block_state.take() {
+                                let notify = Arc::new(tokio::sync::Notify::new());
+                                let id = store.block_registry.register(&block.keys, notify.clone());
+
+                                let triggered = if block.timeout_ms == 0 {
+                                    notify.notified().await;
+                                    true
+                                } else {
+                                    tokio::select! {
+                                        _ = notify.notified() => true,
+                                        _ = tokio::time::sleep(Duration::from_millis(block.timeout_ms as u64)) => false,
+                                    }
+                                };
+
+                                store.block_registry.unregister(id, &block.keys);
+
+                                let response = if triggered {
+                                    unblock_pop(&store, ctx.db_index, &block.keys, &block.pop_direction)
+                                } else {
+                                    RespValue::Array(Some(vec![]))
+                                };
+
+                                let resp_bytes = resp::serialize_response(&response);
+                                socket.write_all(&resp_bytes).await?;
+                            } else {
+                                let resp_bytes = resp::serialize_response(&response);
+                                socket.write_all(&resp_bytes).await?;
+                            }
                         }
                         Err(nom::Err::Incomplete(_)) => break,
                         Err(_) => {
@@ -61,4 +103,20 @@ pub async fn handle(
         }
     }
     Ok(())
+}
+
+fn unblock_pop(store: &Store, db_idx: usize, keys: &[Vec<u8>], dir: &PopDirection) -> resp::RespValue {
+    for key in keys {
+        let result = match dir {
+            PopDirection::Left => store.lpop_one(db_idx, key),
+            PopDirection::Right => store.rpop_one(db_idx, key),
+        };
+        if let Ok(Some(val)) = result {
+            return RespValue::Array(Some(vec![
+                RespValue::bulk_string(key.clone()),
+                RespValue::bulk_string(val),
+            ]));
+        }
+    }
+    RespValue::Array(Some(vec![]))
 }

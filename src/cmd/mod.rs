@@ -4,6 +4,12 @@
 mod server;
 mod string;
 mod generic;
+mod list;
+mod set;
+mod hash;
+mod zset;
+mod stream;
+mod nested_hash;
 
 use std::collections::HashMap;
 use crate::store::Store;
@@ -26,6 +32,12 @@ impl CommandTable {
         table.register(server::COMMANDS);
         table.register(string::COMMANDS);
         table.register(generic::COMMANDS);
+        table.register(list::COMMANDS);
+        table.register(set::COMMANDS);
+        table.register(hash::COMMANDS);
+        table.register(zset::COMMANDS);
+        table.register(stream::COMMANDS);
+        table.register(nested_hash::COMMANDS);
         table
     }
 

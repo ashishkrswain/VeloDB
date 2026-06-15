@@ -20,6 +20,12 @@ pub enum VeloDBError {
     NotInteger,
     #[error("ERR increment or decrement would overflow")]
     Overflow,
+    #[error("ERR index out of range")]
+    IndexOutOfRange,
+    #[error("ERR min or max not a valid float")]
+    MinOrMaxNotValidFloat,
+    #[error("ERR The ID specified in XADD is equal or smaller than the target stream top item")]
+    StreamIDTooSmall,
     #[error("ERR protocol error: {0}")]
     ProtocolError(String),
     #[error("{0}")]
@@ -38,6 +44,9 @@ impl VeloDBError {
     pub fn not_integer() -> Self { Self::NotInteger }
     pub fn overflow() -> Self { Self::Overflow }
     pub fn wrong_type() -> Self { Self::WrongType }
+    pub fn index_out_of_range() -> Self { Self::IndexOutOfRange }
+    pub fn min_max_not_valid_float() -> Self { Self::MinOrMaxNotValidFloat }
+    pub fn stream_id_too_small() -> Self { Self::StreamIDTooSmall }
 }
 
 pub type Result<T> = std::result::Result<T, VeloDBError>;

@@ -5,7 +5,36 @@
 
 All notable changes to VeloDB are documented in this file.
 
-## [Unreleased]
+## [0.2.0] — Phase 2: Data Types
+
+### Added
+- **List type** with 12 commands: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE, LINDEX, LSET, LTRIM, LREM, BLPOP, BRPOP
+- **Set type** with 10 commands: SADD, SREM, SMEMBERS, SISMEMBER, SCARD, SINTER, SUNION, SDIFF, SRANDMEMBER, SPOP
+- **Hash type** with 9 commands: HSET, HGET, HDEL, HEXISTS, HGETALL, HKEYS, HVALS, HLEN, HINCRBY
+- **ZSet type** with 8 commands: ZADD, ZREM, ZSCORE, ZRANK, ZRANGE, ZRANGEBYSCORE, ZCARD, ZCOUNT
+- **Stream type** with 7 commands: XADD, XRANGE, XREVRANGE, XLEN, XDEL, XTRIM, XREAD (basic, no consumer groups)
+- **NestedHash type** with 6 commands: NHSET, NHGET, NHDEL, NHKEYS, NHVALS, NHGETALL
+- **StorageValue enum**: String, List (VecDeque), Set (HashSet), Hash (HashMap), ZSet (dual-index HashMap + BTreeMap), Stream (VecDeque with last-ID tracking), NestedHash (HashMap of HashMaps)
+- **BlockRegistry**: DashMap-based waiter registry for BLPOP/BRPOP blocking support with tokio::Notify
+- **Blocking architecture**: Full BLPOP/BRPOP with timeout support — connection parks on Notify, wakes on LPUSH/RPUSH, returns nil on timeout
+- **ZSet dual-index**: members HashMap (O(1) score lookup) + scores BTreeMap (ordered iteration) for efficient ZRANGE/ZRANGEBYSCORE
+- **ZSet score bound parsing**: Support for -inf, +inf, (exclusive bounds in ZRANGEBYSCORE and ZCOUNT
+- **Stream ID generation**: Auto-generating IDs via *, partial IDs (ms-*), validation against last ID
+- **NestedHash hierarchical operations**: Field-level and subfield-level get/set/del/keys/vals/getall
+
+### Changed
+- **Entry struct**: Removed `type_name` field — type is now encoded in the `StorageValue` enum variant
+- **Store::get_type()**: Returns type name by matching on StorageValue variant instead of reading a String field
+- **Store::get()**: WRONGTYPE error when called on non-string keys
+- **WRONGTYPE enforcement**: INCR, DECR, APPEND, STRLEN, GETRANGE, SETRANGE now check for string type
+- **ClientContext**: Added `block_state: Option<BlockState>` for connection-level blocking support
+- **connection::handle()**: Blocking path — detects block_state after dispatch, registers on BlockRegistry, parks, unblocks with result
+
+### Infrastructure
+- 6 new command modules: list.rs, set.rs, hash.rs, zset.rs, stream.rs, nested_hash.rs
+- 52 new commands registered (total now 34 + 52 = 86)
+
+## [0.1.0] — Phase 1: Core Server
 
 ### Added
 - Project setup with Cargo.toml (tokio, bytes, nom, dashmap, clap, tracing, thiserror, serde, crc16, parking_lot)
