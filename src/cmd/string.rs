@@ -5,6 +5,7 @@ use super::CommandDef;
 use crate::store::Store;
 use crate::resp::RespValue;
 use crate::net::connection::ClientContext;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const COMMANDS: &[CommandDef] = &[
     CommandDef { name: "GET", arity: 2, handler: get },
@@ -40,7 +41,15 @@ fn set(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error
                 if let Some(v) = flag_args.get(i + 1) {
                     if let Ok(n) = String::from_utf8_lossy(v).parse::<i64>() {
                         expire_ms = match flag.as_str() {
-                            "EX" | "EXAT" => Some((n * 1000) as u64),
+                            "EX" => {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                                Some(now + (n * 1000) as u64)
+                            }
+                            "PX" => {
+                                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                                Some(now + n as u64)
+                            }
+                            "EXAT" => Some((n * 1000) as u64),
                             _ => Some(n as u64),
                         };
                     }

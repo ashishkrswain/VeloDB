@@ -302,8 +302,10 @@ impl Store {
             Some(e) => match &e.value {
                 StorageValue::List(list) => {
                     let len = list.len() as i64;
-                    let i = if idx < 0 { (len + idx).max(0) } else { idx.min(len - 1) } as usize;
-                    Ok(list.get(i).cloned())
+                    if len == 0 { return Ok(None); }
+                    let i = if idx < 0 { len + idx } else { idx };
+                    if i < 0 || i >= len { return Ok(None); }
+                    Ok(list.get(i as usize).cloned())
                 }
                 _ => Err(VeloDBError::wrong_type()),
             },
@@ -1079,4 +1081,733 @@ fn simple_match(s: &str, p: &str) -> bool {
     }
     while pi < p.len() && p[pi] == b'*' { pi += 1; }
     pi == p.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    fn make_store() -> Store { Store::new(1) }
+
+    fn key(s: &str) -> Vec<u8> { s.as_bytes().to_vec() }
+    fn val(s: &str) -> Vec<u8> { s.as_bytes().to_vec() }
+
+    // ========= String =========
+    #[test]
+    fn test_get_set_roundtrip() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert_eq!(s.get(0, b"k").unwrap().unwrap(), b"v");
+    }
+
+    #[test]
+    fn test_get_nonexistent() {
+        let s = make_store();
+        assert!(matches!(s.get(0, b"nx"), Ok(None)));
+    }
+
+    #[test]
+    fn test_set_overwrite() {
+        let s = make_store();
+        s.set(0, b"k", b"a", None).unwrap();
+        s.set(0, b"k", b"b", None).unwrap();
+        assert_eq!(s.get(0, b"k").unwrap().unwrap(), b"b");
+    }
+
+    #[test]
+    fn test_del_existing() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.del(0, b"k").unwrap());
+        assert_eq!(s.get(0, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_del_nonexistent() {
+        let s = make_store();
+        assert!(!s.del(0, b"nx").unwrap());
+    }
+
+    #[test]
+    fn test_exists() {
+        let s = make_store();
+        assert!(!s.exists(0, b"k").unwrap());
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.exists(0, b"k").unwrap());
+    }
+
+    #[test]
+    fn test_type_string() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert_eq!(s.get_type(0, b"k").unwrap(), Some("string".into()));
+    }
+
+    #[test]
+    fn test_type_none() {
+        let s = make_store();
+        assert_eq!(s.get_type(0, b"nx").unwrap(), None);
+    }
+
+    // ========= List =========
+    #[test]
+    fn test_lpush_length() {
+        let s = make_store();
+        assert_eq!(s.lpush(0, b"l", &[b"a".to_vec()]).unwrap(), 1);
+        assert_eq!(s.lpush(0, b"l", &[b"b".to_vec(), b"c".to_vec()]).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_rpush_length() {
+        let s = make_store();
+        assert_eq!(s.rpush(0, b"l", &[b"a".to_vec()]).unwrap(), 1);
+        assert_eq!(s.rpush(0, b"l", &[b"b".to_vec()]).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_lpush_rpush_order() {
+        let s = make_store();
+        s.lpush(0, b"l", &[b"a".to_vec()]).unwrap();
+        s.rpush(0, b"l", &[b"b".to_vec()]).unwrap();
+        s.lpush(0, b"l", &[b"c".to_vec()]).unwrap();
+        assert_eq!(s.lrange(0, b"l", 0, 2).unwrap(), vec![b"c", b"a", b"b"]);
+    }
+
+    #[test]
+    fn test_lpop_rpop() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]).unwrap();
+        assert_eq!(s.lpop_one(0, b"l").unwrap(), Some(b"a".to_vec()));
+        assert_eq!(s.rpop_one(0, b"l").unwrap(), Some(b"c".to_vec()));
+        assert_eq!(s.rpop_one(0, b"l").unwrap(), Some(b"b".to_vec()));
+        assert_eq!(s.lpop_one(0, b"l").unwrap(), None);
+    }
+
+    #[test]
+    fn test_lpop_nonexistent() {
+        let s = make_store();
+        assert_eq!(s.lpop_one(0, b"nx").unwrap(), None);
+    }
+
+    #[test]
+    fn test_llen() {
+        let s = make_store();
+        assert_eq!(s.llen(0, b"l").unwrap(), 0);
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        assert_eq!(s.llen(0, b"l").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_lrange_negative_indices() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]).unwrap();
+        assert_eq!(s.lrange(0, b"l", -2, -1).unwrap(), vec![b"b", b"c"]);
+        assert_eq!(s.lrange(0, b"l", 0, -1).unwrap(), vec![b"a", b"b", b"c"]);
+    }
+
+    #[test]
+    fn test_lrange_oob() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec()]).unwrap();
+        assert!(s.lrange(0, b"l", 5, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_lindex() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        assert_eq!(s.lindex(0, b"l", 0).unwrap(), Some(b"a".to_vec()));
+        assert_eq!(s.lindex(0, b"l", -1).unwrap(), Some(b"b".to_vec()));
+        assert_eq!(s.lindex(0, b"l", 5).unwrap(), None);
+    }
+
+    #[test]
+    fn test_lset() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        s.lset(0, b"l", 0, b"x").unwrap();
+        assert_eq!(s.lindex(0, b"l", 0).unwrap(), Some(b"x".to_vec()));
+    }
+
+    #[test]
+    fn test_lset_oob() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec()]).unwrap();
+        assert!(s.lset(0, b"l", 5, b"x").is_err());
+    }
+
+    #[test]
+    fn test_ltrim() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]).unwrap();
+        s.ltrim(0, b"l", 1, 2).unwrap();
+        assert_eq!(s.lrange(0, b"l", 0, -1).unwrap(), vec![b"b", b"c"]);
+    }
+
+    #[test]
+    fn test_lrem_positive_count() {
+        let s = make_store();
+        s.rpush(0, b"l", &[b"a".to_vec(), b"b".to_vec(), b"a".to_vec()]).unwrap();
+        assert_eq!(s.lrem(0, b"l", 1, b"a").unwrap(), 1);
+        assert_eq!(s.lrange(0, b"l", 0, -1).unwrap(), vec![b"b", b"a"]);
+    }
+
+    #[test]
+    fn test_list_wrongtype() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.lpush(0, b"k", &[b"a".to_vec()]).is_err());
+    }
+
+    // ========= Set =========
+    #[test]
+    fn test_sadd_count() {
+        let s = make_store();
+        assert_eq!(s.sadd(0, b"s", &[b"a".to_vec(), b"b".to_vec()]).unwrap(), 2);
+        assert_eq!(s.sadd(0, b"s", &[b"a".to_vec()]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_srem() {
+        let s = make_store();
+        s.sadd(0, b"s", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        assert_eq!(s.srem(0, b"s", &[b"a".to_vec()]).unwrap(), 1);
+        assert_eq!(s.scard(0, b"s").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_smembers() {
+        let s = make_store();
+        s.sadd(0, b"s", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        let members = s.smembers(0, b"s").unwrap();
+        assert!(members.contains(&b"a".to_vec()));
+        assert!(members.contains(&b"b".to_vec()));
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn test_sismember() {
+        let s = make_store();
+        s.sadd(0, b"s", &[b"a".to_vec()]).unwrap();
+        assert!(s.sismember(0, b"s", b"a").unwrap());
+        assert!(!s.sismember(0, b"s", b"b").unwrap());
+    }
+
+    #[test]
+    fn test_scard() {
+        let s = make_store();
+        assert_eq!(s.scard(0, b"s").unwrap(), 0);
+        s.sadd(0, b"s", &[b"a".to_vec()]).unwrap();
+        assert_eq!(s.scard(0, b"s").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_sinter() {
+        let s = make_store();
+        s.sadd(0, b"s1", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        s.sadd(0, b"s2", &[b"b".to_vec(), b"c".to_vec()]).unwrap();
+        assert_eq!(s.sinter(0, &[b"s1".to_vec(), b"s2".to_vec()]).unwrap(), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn test_sinter_missing_key() {
+        let s = make_store();
+        s.sadd(0, b"s1", &[b"a".to_vec()]).unwrap();
+        assert!(s.sinter(0, &[b"s1".to_vec(), b"nx".to_vec()]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_sunion() {
+        let s = make_store();
+        s.sadd(0, b"s1", &[b"a".to_vec()]).unwrap();
+        s.sadd(0, b"s2", &[b"b".to_vec()]).unwrap();
+        let union = s.sunion(0, &[b"s1".to_vec(), b"s2".to_vec()]).unwrap();
+        assert!(union.contains(&b"a".to_vec()));
+        assert!(union.contains(&b"b".to_vec()));
+        assert_eq!(union.len(), 2);
+    }
+
+    #[test]
+    fn test_sdiff() {
+        let s = make_store();
+        s.sadd(0, b"s1", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        s.sadd(0, b"s2", &[b"b".to_vec()]).unwrap();
+        assert_eq!(s.sdiff(0, &[b"s1".to_vec(), b"s2".to_vec()]).unwrap(), vec![b"a".to_vec()]);
+    }
+
+    #[test]
+    fn test_srandmember() {
+        let s = make_store();
+        s.sadd(0, b"s", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        let result = s.srandmember(0, b"s", None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0] == b"a" || result[0] == b"b");
+    }
+
+    // ========= Hash =========
+    #[test]
+    fn test_hset_hget() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f".to_vec(), b"v".to_vec())]).unwrap();
+        assert_eq!(s.hget(0, b"h", b"f").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_hset_count_new_only() {
+        let s = make_store();
+        assert_eq!(s.hset(0, b"h", &[(b"f1".to_vec(), b"v1".to_vec()), (b"f2".to_vec(), b"v2".to_vec())]).unwrap(), 2);
+        assert_eq!(s.hset(0, b"h", &[(b"f1".to_vec(), b"new".to_vec())]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_hdel() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f".to_vec(), b"v".to_vec())]).unwrap();
+        assert_eq!(s.hdel(0, b"h", &[b"f".to_vec()]).unwrap(), 1);
+        assert_eq!(s.hget(0, b"h", b"f").unwrap(), None);
+    }
+
+    #[test]
+    fn test_hexists() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f".to_vec(), b"v".to_vec())]).unwrap();
+        assert!(s.hexists(0, b"h", b"f").unwrap());
+        assert!(!s.hexists(0, b"h", b"nx").unwrap());
+    }
+
+    #[test]
+    fn test_hgetall() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f1".to_vec(), b"v1".to_vec()), (b"f2".to_vec(), b"v2".to_vec())]).unwrap();
+        let all = s.hgetall(0, b"h").unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn test_hkeys_hvals() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f1".to_vec(), b"v1".to_vec())]).unwrap();
+        assert_eq!(s.hkeys(0, b"h").unwrap(), vec![b"f1".to_vec()]);
+        assert_eq!(s.hvals(0, b"h").unwrap(), vec![b"v1".to_vec()]);
+    }
+
+    #[test]
+    fn test_hlen() {
+        let s = make_store();
+        assert_eq!(s.hlen(0, b"h").unwrap(), 0);
+        s.hset(0, b"h", &[(b"f".to_vec(), b"v".to_vec())]).unwrap();
+        assert_eq!(s.hlen(0, b"h").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_hincrby() {
+        let s = make_store();
+        assert_eq!(s.hincrby(0, b"h", b"f", 1).unwrap(), 1);
+        assert_eq!(s.hincrby(0, b"h", b"f", 4).unwrap(), 5);
+    }
+
+    #[test]
+    fn test_hash_wrongtype() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.hget(0, b"k", b"f").is_err());
+    }
+
+    // ========= ZSet =========
+    #[test]
+    fn test_zadd_zscore() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec())]).unwrap();
+        assert_eq!(s.zscore(0, b"z", b"a").unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn test_zadd_count_new_only() {
+        let s = make_store();
+        assert_eq!(s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec())]).unwrap(), 2);
+        assert_eq!(s.zadd(0, b"z", &[(3.0, b"a".to_vec())]).unwrap(), 0);
+        assert_eq!(s.zscore(0, b"z", b"a").unwrap(), Some(3.0));
+    }
+
+    #[test]
+    fn test_zrem() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec())]).unwrap();
+        assert_eq!(s.zrem(0, b"z", &[b"a".to_vec()]).unwrap(), 1);
+        assert_eq!(s.zscore(0, b"z", b"a").unwrap(), None);
+    }
+
+    #[test]
+    fn test_zcard() {
+        let s = make_store();
+        assert_eq!(s.zcard(0, b"z").unwrap(), 0);
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec())]).unwrap();
+        assert_eq!(s.zcard(0, b"z").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_zrank() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec()), (0.5, b"c".to_vec())]).unwrap();
+        assert_eq!(s.zrank(0, b"z", b"c").unwrap(), Some(0));
+        assert_eq!(s.zrank(0, b"z", b"a").unwrap(), Some(1));
+        assert_eq!(s.zrank(0, b"z", b"b").unwrap(), Some(2));
+    }
+
+    #[test]
+    fn test_zrank_missing() {
+        let s = make_store();
+        assert_eq!(s.zrank(0, b"z", b"nx").unwrap(), None);
+    }
+
+    #[test]
+    fn test_zrange() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec())]).unwrap();
+        let range = s.zrange(0, b"z", 0, -1, false).unwrap();
+        assert_eq!(range.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(), vec![b"a", b"b"]);
+    }
+
+    #[test]
+    fn test_zrangebyscore() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec()), (3.0, b"c".to_vec())]).unwrap();
+        let result = s.zrange_by_score(0, b"z", 1.5, false, 2.5, false, false, None).unwrap();
+        assert_eq!(result.iter().map(|(m, _)| m.clone()).collect::<Vec<_>>(), vec![b"b".to_vec()]);
+    }
+
+    #[test]
+    fn test_zcount() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec()), (3.0, b"c".to_vec())]).unwrap();
+        assert_eq!(s.zcount(0, b"z", 1.5, false, 3.0, false).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_zset_wrongtype() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.zadd(0, b"k", &[(1.0, b"a".to_vec())]).is_err());
+    }
+
+    // ========= Stream =========
+    #[test]
+    fn test_xadd_auto_id() {
+        let s = make_store();
+        let id = s.xadd(0, b"s", b"*", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        assert!(!id.is_empty());
+        assert!(String::from_utf8_lossy(&id).contains('-'));
+    }
+
+    #[test]
+    fn test_xadd_explicit_id() {
+        let s = make_store();
+        let id = s.xadd(0, b"s", b"1000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        assert_eq!(id, b"1000-0");
+    }
+
+    #[test]
+    fn test_xadd_id_too_small() {
+        let s = make_store();
+        s.xadd(0, b"s", b"2000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        assert!(s.xadd(0, b"s", b"1000-0", &[(b"f2".to_vec(), b"v2".to_vec())], None).is_err());
+    }
+
+    #[test]
+    fn test_xlen() {
+        let s = make_store();
+        assert_eq!(s.xlen(0, b"s").unwrap(), 0);
+        s.xadd(0, b"s", b"*", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        assert_eq!(s.xlen(0, b"s").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_xrange() {
+        let s = make_store();
+        s.xadd(0, b"s", b"1000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        s.xadd(0, b"s", b"2000-0", &[(b"f2".to_vec(), b"v2".to_vec())], None).unwrap();
+        let range = s.xrange(0, b"s", b"1000-0", b"2000-0", None).unwrap();
+        assert_eq!(range.len(), 2);
+    }
+
+    #[test]
+    fn test_xrevrange() {
+        let s = make_store();
+        s.xadd(0, b"s", b"1000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        s.xadd(0, b"s", b"2000-0", &[(b"f2".to_vec(), b"v2".to_vec())], None).unwrap();
+        let range = s.xrevrange(0, b"s", b"+", b"-", None).unwrap();
+        assert_eq!(range.len(), 2);
+        assert_eq!(range[0].id_ms, 2000);
+    }
+
+    #[test]
+    fn test_xdel() {
+        let s = make_store();
+        s.xadd(0, b"s", b"1000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        assert_eq!(s.xdel(0, b"s", &["1000-0".into()]).unwrap(), 1);
+        assert_eq!(s.xlen(0, b"s").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_xtrim() {
+        let s = make_store();
+        for i in 1..=5 {
+            s.xadd(0, b"s", format!("{}-0", i).as_bytes(), &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        }
+        assert_eq!(s.xtrim(0, b"s", 2).unwrap(), 3);
+        assert_eq!(s.xlen(0, b"s").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_xread() {
+        let s = make_store();
+        s.xadd(0, b"s", b"1000-0", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        let result = s.xread(0, &[b"s".to_vec()], &[(0, 0)], None, None).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, b"s");
+        assert_eq!(result[0].1.len(), 1);
+    }
+
+    #[test]
+    fn test_stream_wrongtype() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.xadd(0, b"k", b"*", &[(b"f".to_vec(), b"v".to_vec())], None).is_err());
+    }
+
+    // ========= NestedHash =========
+    #[test]
+    fn test_nhset_nhget() {
+        let s = make_store();
+        assert_eq!(s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap(), 1);
+        assert_eq!(s.nhget(0, b"nh", b"f1", b"sf1").unwrap(), Some(b"v".to_vec()));
+    }
+
+    #[test]
+    fn test_nhset_replace() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"a").unwrap();
+        assert_eq!(s.nhset(0, b"nh", b"f1", b"sf1", b"b").unwrap(), 0);
+        assert_eq!(s.nhget(0, b"nh", b"f1", b"sf1").unwrap(), Some(b"b".to_vec()));
+    }
+
+    #[test]
+    fn test_nhdel_subfield() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        assert_eq!(s.nhdel(0, b"nh", b"f1", Some(b"sf1")).unwrap(), 1);
+        assert_eq!(s.nhget(0, b"nh", b"f1", b"sf1").unwrap(), None);
+    }
+
+    #[test]
+    fn test_nhdel_field() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        assert_eq!(s.nhdel(0, b"nh", b"f1", None).unwrap(), 1);
+        assert_eq!(s.nhkeys(0, b"nh", None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_nhkeys_top() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        s.nhset(0, b"nh", b"f2", b"sf2", b"v").unwrap();
+        let keys = s.nhkeys(0, b"nh", None).unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_nhkeys_subfield() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        s.nhset(0, b"nh", b"f1", b"sf2", b"v").unwrap();
+        let keys = s.nhkeys(0, b"nh", Some(b"f1")).unwrap();
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_nhvals() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v1").unwrap();
+        s.nhset(0, b"nh", b"f1", b"sf2", b"v2").unwrap();
+        let vals = s.nhvals(0, b"nh", Some(b"f1")).unwrap();
+        assert!(vals.contains(&b"v1".to_vec()));
+        assert!(vals.contains(&b"v2".to_vec()));
+    }
+
+    #[test]
+    fn test_nhgetall() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        let all = s.nhgetall(0, b"nh", Some(b"f1")).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_nhgetall_top() {
+        let s = make_store();
+        s.nhset(0, b"nh", b"f1", b"sf1", b"v").unwrap();
+        let all = s.nhgetall(0, b"nh", None).unwrap();
+        assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_nh_wrongtype() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        assert!(s.nhset(0, b"k", b"f", b"sf", b"v").is_err());
+    }
+
+    // ========= Expiry =========
+    #[test]
+    fn test_set_expire_get_expire() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        s.set_expire(0, b"k", now + 5_000_000).unwrap();
+        assert!(s.get_expire(0, b"k").unwrap().is_some());
+    }
+
+    #[test]
+    fn test_persist() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        s.set_expire(0, b"k", now + 5_000_000).unwrap();
+        assert!(s.remove_expire(0, b"k").unwrap());
+        assert_eq!(s.get_expire(0, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_expire_immediate() {
+        let s = make_store();
+        s.set(0, b"k", b"v", None).unwrap();
+        s.set_expire(0, b"k", 0).unwrap();
+        assert_eq!(s.get(0, b"k").unwrap(), None);
+    }
+
+    #[test]
+    fn test_rename() {
+        let s = make_store();
+        s.set(0, b"old", b"v", None).unwrap();
+        s.rename(0, b"old", b"new").unwrap();
+        assert!(!s.exists(0, b"old").unwrap());
+        assert_eq!(s.get(0, b"new").unwrap().unwrap(), b"v");
+    }
+
+    #[test]
+    fn test_dbsize() {
+        let s = make_store();
+        assert_eq!(s.dbsize(0).unwrap(), 0);
+        s.set(0, b"a", b"v", None).unwrap();
+        s.set(0, b"b", b"v", None).unwrap();
+        assert_eq!(s.dbsize(0).unwrap(), 2);
+    }
+
+    #[test]
+    fn test_dbsize_excludes_expired() {
+        let s = make_store();
+        s.set(0, b"a", b"v", None).unwrap();
+        s.set(0, b"b", b"v", None).unwrap();
+        s.set_expire(0, b"b", 0).unwrap();
+        assert_eq!(s.dbsize(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_flushdb() {
+        let s = make_store();
+        s.set(0, b"a", b"v", None).unwrap();
+        s.flushdb(0).unwrap();
+        assert_eq!(s.dbsize(0).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_flushall() {
+        let s = Store::new(2);
+        s.set(0, b"a", b"v", None).unwrap();
+        s.set(1, b"b", b"v", None).unwrap();
+        s.flushall().unwrap();
+        assert_eq!(s.dbsize(0).unwrap(), 0);
+        assert_eq!(s.dbsize(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_random_key() {
+        let s = make_store();
+        assert_eq!(s.random_key(0).unwrap(), None);
+        s.set(0, b"a", b"v", None).unwrap();
+        assert_eq!(s.random_key(0).unwrap(), Some(b"a".to_vec()));
+    }
+
+    #[test]
+    fn test_keys_pattern() {
+        let s = make_store();
+        s.set(0, b"aa", b"v", None).unwrap();
+        s.set(0, b"ab", b"v", None).unwrap();
+        s.set(0, b"ba", b"v", None).unwrap();
+        let keys = s.keys(0, "a*").unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(keys.contains(&b"aa".to_vec()));
+        assert!(keys.contains(&b"ab".to_vec()));
+    }
+
+    // ========= BlockRegistry =========
+    #[test]
+    fn test_block_register_unregister() {
+        let br = BlockRegistry::new();
+        let n = Arc::new(Notify::new());
+        let k: Vec<u8> = b"k".to_vec();
+        let id = br.register(&[k.clone()], n.clone());
+        assert!(br.waiters.contains_key(&k));
+        br.unregister(id, &[k.clone()]);
+        let w = br.waiters.get(&k);
+        assert!(w.map_or(true, |r| r.is_empty()));
+    }
+
+    #[test]
+    fn test_block_notify_wakes() {
+        let br = BlockRegistry::new();
+        let n = Arc::new(Notify::new());
+        let k: Vec<u8> = b"k".to_vec();
+        br.register(&[k.clone()], n.clone());
+        br.notify(&k);
+        // After notify, the waiter list should be cleared
+        let w = br.waiters.get(&k);
+        assert!(w.map_or(true, |r| r.is_empty()));
+    }
+
+    #[test]
+    fn test_block_notify_no_waiters() {
+        let br = BlockRegistry::new();
+        let k: Vec<u8> = b"nx".to_vec();
+        br.notify(&k);
+    }
+
+    #[test]
+    fn test_block_multiple_keys() {
+        let br = BlockRegistry::new();
+        let n = Arc::new(Notify::new());
+        let k1: Vec<u8> = b"k1".to_vec();
+        let k2: Vec<u8> = b"k2".to_vec();
+        br.register(&[k1.clone(), k2.clone()], n.clone());
+        br.notify(&k1);
+        let w = br.waiters.get(&k1);
+        assert!(w.map_or(true, |r| r.is_empty()));
+    }
+
+    #[test]
+    fn test_block_id_isolation() {
+        let br = BlockRegistry::new();
+        let n1 = Arc::new(Notify::new());
+        let n2 = Arc::new(Notify::new());
+        let k: Vec<u8> = b"k".to_vec();
+        let id1 = br.register(&[k.clone()], n1);
+        let id2 = br.register(&[k.clone()], n2);
+        assert_ne!(id1, id2);
+        br.unregister(id1, &[k.clone()]);
+        let w = br.waiters.get(&k).unwrap();
+        assert_eq!(w.len(), 1);
+    }
 }

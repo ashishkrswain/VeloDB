@@ -5,6 +5,18 @@
 
 All notable changes to VeloDB are documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Comprehensive test suite**: 143 tests covering store, parser, serializer, config, commands, and TCP integration
+- **Unit tests**: 116 tests across store/memory (86), RESP parser (15), RESP serializer (8), and config (7)
+- **Integration tests**: 27 end-to-end TCP roundtrip tests covering all 6 data types, expiry, pipelining, error responses, SELECT isolation, and WRONGTYPE enforcement
+- **`src/lib.rs`**: Library crate exposing all modules for integration test access
+
+### Fixed
+- **SET EX/PX expiration**: EX and PX flags now properly calculate absolute timestamps instead of storing relative durations
+- **LINDEX out-of-bounds**: LINDEX with index beyond list bounds now correctly returns nil instead of clamping
+
 ## [0.2.0] — Phase 2: Data Types
 
 ### Added

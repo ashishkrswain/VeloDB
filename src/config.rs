@@ -60,3 +60,52 @@ fn parse_redis_config(content: &str) -> anyhow::Result<ServerConfig> {
     }
     Ok(config)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let config = ServerConfig::default();
+        assert_eq!(config.port, 6379);
+        assert_eq!(config.databases, 16);
+    }
+
+    #[test]
+    fn test_parse_port() {
+        let config = parse_redis_config("port 6380").unwrap();
+        assert_eq!(config.port, 6380);
+    }
+
+    #[test]
+    fn test_parse_bind_address() {
+        let config = parse_redis_config("bind 0.0.0.0").unwrap();
+        assert_eq!(config.bind_address, "0.0.0.0");
+    }
+
+    #[test]
+    fn test_parse_databases() {
+        let config = parse_redis_config("databases 32").unwrap();
+        assert_eq!(config.databases, 32);
+    }
+
+    #[test]
+    fn test_parse_tcp_keepalive() {
+        let config = parse_redis_config("tcp-keepalive 60").unwrap();
+        assert_eq!(config.tcp_keepalive, 60);
+    }
+
+    #[test]
+    fn test_parse_comments_and_blanks() {
+        let input = "# this is a comment\n\nport 6390\n\n# another comment";
+        let config = parse_redis_config(input).unwrap();
+        assert_eq!(config.port, 6390);
+    }
+
+    #[test]
+    fn test_parse_unknown_keywords_ignored() {
+        let config = parse_redis_config("unknown-key value\nport 6399").unwrap();
+        assert_eq!(config.port, 6399);
+    }
+}

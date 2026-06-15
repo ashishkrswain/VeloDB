@@ -26,3 +26,67 @@ fn serialize_value(value: &RespValue, out: &mut Vec<u8>) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resp::parser;
+
+    #[test]
+    fn test_serialize_simple_string() {
+        let bytes = serialize_response(&RespValue::SimpleString("OK".into()));
+        assert_eq!(bytes, b"+OK\r\n");
+    }
+
+    #[test]
+    fn test_serialize_error() {
+        let bytes = serialize_response(&RespValue::Error("ERR msg".into()));
+        assert_eq!(bytes, b"-ERR msg\r\n");
+    }
+
+    #[test]
+    fn test_serialize_integer() {
+        let bytes = serialize_response(&RespValue::Integer(42));
+        assert_eq!(bytes, b":42\r\n");
+    }
+
+    #[test]
+    fn test_serialize_bulk_string() {
+        let bytes = serialize_response(&RespValue::BulkString(Some(b"hello".to_vec())));
+        assert_eq!(bytes, b"$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null() {
+        let bytes = serialize_response(&RespValue::BulkString(None));
+        assert_eq!(bytes, b"$-1\r\n");
+    }
+
+    #[test]
+    fn test_serialize_array() {
+        let val = RespValue::Array(Some(vec![
+            RespValue::Integer(1),
+            RespValue::BulkString(Some(b"foo".to_vec())),
+        ]));
+        let bytes = serialize_response(&val);
+        assert_eq!(bytes, b"*2\r\n:1\r\n$3\r\nfoo\r\n");
+    }
+
+    #[test]
+    fn test_serialize_null_array() {
+        let bytes = serialize_response(&RespValue::Array(None));
+        assert_eq!(bytes, b"*-1\r\n");
+    }
+
+    #[test]
+    fn test_roundtrip() {
+        let original = RespValue::Array(Some(vec![
+            RespValue::SimpleString("OK".into()),
+            RespValue::Integer(42),
+            RespValue::BulkString(Some(b"data".to_vec())),
+        ]));
+        let bytes = serialize_response(&original);
+        let (_, parsed) = parser::resp_value(&bytes).unwrap();
+        assert_eq!(parsed, original);
+    }
+}
