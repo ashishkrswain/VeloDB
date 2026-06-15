@@ -17,7 +17,7 @@ pub struct StreamEntry {
 }
 
 #[derive(Clone, PartialEq, PartialOrd)]
-struct OrderedF64(f64);
+pub(crate) struct OrderedF64(pub(crate) f64);
 
 impl Eq for OrderedF64 {}
 impl Ord for OrderedF64 {
@@ -27,7 +27,7 @@ impl Ord for OrderedF64 {
 }
 
 #[derive(Clone)]
-enum StorageValue {
+pub(crate) enum StorageValue {
     String(Vec<u8>),
     List(VecDeque<Vec<u8>>),
     Set(HashSet<Vec<u8>>),
@@ -59,9 +59,9 @@ impl StorageValue {
 }
 
 #[derive(Clone)]
-struct Entry {
-    value: StorageValue,
-    expire_at: Option<u64>,
+pub(crate) struct Entry {
+    pub(crate) value: StorageValue,
+    pub(crate) expire_at: Option<u64>,
 }
 
 pub struct BlockRegistry {
@@ -217,6 +217,19 @@ impl Store {
         if keys.is_empty() { return Ok(None); }
         let idx = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as usize % keys.len();
         Ok(Some(keys[idx].clone()))
+    }
+
+    pub fn iterate_db(&self, db_idx: usize) -> Result<Vec<(Vec<u8>, Entry)>> {
+        let db = self.db(db_idx)?;
+        Ok(db.iter()
+            .filter(|e| !Self::expired(e))
+            .map(|e| (e.key().clone(), e.clone()))
+            .collect())
+    }
+
+    pub fn set_with_entry(&self, db_idx: usize, key: Vec<u8>, value: StorageValue, expire_ms: Option<u64>) -> Result<()> {
+        self.db(db_idx)?.insert(key, Entry { value, expire_at: expire_ms });
+        Ok(())
     }
 
     // ========= List methods =========

@@ -11,6 +11,7 @@ use crate::cmd::CommandTable;
 use crate::resp::{self, RespValue};
 use crate::config::ServerConfig;
 use crate::error::VeloDBError;
+use crate::persist::aof::{AofWriter, encode_command_for_aof};
 
 const MAX_QUERY_BUFFER: usize = 1024 * 1024 * 1024;
 
@@ -36,6 +37,7 @@ pub async fn handle(
     store: Arc<Store>,
     cmd_table: Arc<CommandTable>,
     _config: ServerConfig,
+    aof_writer: Option<Arc<AofWriter>>,
 ) -> anyhow::Result<()> {
     let mut buf = bytes::BytesMut::with_capacity(4096);
     let mut ctx = ClientContext::new();
@@ -58,6 +60,14 @@ pub async fn handle(
                             let response = cmd_table.dispatch(&cmd_name, &store, &mut ctx, &args[1..]);
                             let consumed = buf.len() - remaining.len();
                             buf.advance(consumed);
+
+                            // AOF logging for write commands
+                            if let Some(aof) = &aof_writer {
+                                if is_write_command(&cmd_name) {
+                                    let aof_entry = encode_command_for_aof(&args);
+                                    let _ = aof.append(&aof_entry);
+                                }
+                            }
 
                             if let Some(block) = ctx.block_state.take() {
                                 let notify = Arc::new(tokio::sync::Notify::new());
@@ -119,4 +129,19 @@ fn unblock_pop(store: &Store, db_idx: usize, keys: &[Vec<u8>], dir: &PopDirectio
         }
     }
     RespValue::Array(Some(vec![]))
+}
+
+fn is_write_command(name: &str) -> bool {
+    matches!(name,
+        "SET" | "SETRANGE" | "MSET" | "INCR" | "INCRBY" | "DECR" | "DECRBY" | "APPEND" | "GETSET" |
+        "LPUSH" | "RPUSH" | "LPOP" | "RPOP" | "LSET" | "LTRIM" | "LREM" |
+        "SADD" | "SREM" | "SPOP" |
+        "HSET" | "HDEL" | "HINCRBY" |
+        "ZADD" | "ZREM" |
+        "XADD" | "XDEL" | "XTRIM" |
+        "NHSET" | "NHDEL" |
+        "DEL" | "RENAME" | "RENAMENX" |
+        "EXPIRE" | "EXPIREAT" | "PEXPIRE" | "PEXPIREAT" | "PERSIST" |
+        "FLUSHDB" | "FLUSHALL" | "SELECT"
+    )
 }

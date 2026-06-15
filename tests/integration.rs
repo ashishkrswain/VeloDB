@@ -47,7 +47,8 @@ async fn spawn_server(port: u16) -> ServerHandle {
     let mut config = ServerConfig::default();
     config.port = port;
     config.databases = 4;
-    ServerHandle::new(&config).await.unwrap()
+    let store = std::sync::Arc::new(velodb::store::Store::new(config.databases));
+    ServerHandle::new(&config, store, None).await.unwrap()
 }
 
 // ========= String Commands =========
@@ -572,3 +573,96 @@ async fn test_wrong_number_of_args() {
     let resp = send_cmd(&mut stream, &["GET"]).await;
     assert!(String::from_utf8_lossy(&resp).contains("ERR wrong number of arguments"));
 }
+
+// ========= Persistence tests =========
+#[tokio::test]
+async fn test_rdb_save_and_load() {
+    use std::fs;
+    use velodb::store::Store;
+    use velodb::persist::rdb;
+
+    let dir = tempfile::tempdir().unwrap();
+    let rdb_path = dir.path().join("dump.rdb");
+    let store = std::sync::Arc::new(Store::new(2));
+
+    store.set(0, b"str", b"value", None).unwrap();
+    store.lpush(0, b"lst", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+    store.sadd(0, b"set", &[b"x".to_vec()]).unwrap();
+    store.hset(0, b"hash", &[(b"f".to_vec(), b"v".to_vec())]).unwrap();
+    store.zadd(0, b"zset", &[(1.0, b"m".to_vec())]).unwrap();
+
+    rdb::save_rdb(&store, &rdb_path, 2).unwrap();
+    assert!(rdb_path.exists());
+
+    let fresh_store = std::sync::Arc::new(Store::new(2));
+    let count = rdb::load_rdb(&fresh_store, &rdb_path).unwrap();
+    assert!(count >= 5);
+
+    assert_eq!(fresh_store.get(0, b"str").unwrap().unwrap(), b"value");
+    assert!(!fresh_store.smembers(0, b"set").unwrap().is_empty());
+    assert_eq!(fresh_store.hget(0, b"hash", b"f").unwrap(), Some(b"v".to_vec()));
+}
+
+#[tokio::test]
+async fn test_aof_append_and_replay() {
+    use std::fs;
+    use std::sync::Arc;
+    use velodb::store::Store;
+    use velodb::persist::aof::{AofWriter, FsyncPolicy, load_aof, encode_command_for_aof};
+
+    let dir = tempfile::tempdir().unwrap();
+    let aof_path = dir.path().join("test.aof");
+    let aof = Arc::new(AofWriter::open(aof_path.clone(), FsyncPolicy::Always).unwrap());
+
+    aof.append(&encode_command_for_aof(&[b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()])).unwrap();
+    aof.append(&encode_command_for_aof(&[b"EXPIRE".to_vec(), b"k".to_vec(), b"1000".to_vec()])).unwrap();
+    aof.sync().unwrap();
+
+    let commands = load_aof(&aof_path).unwrap();
+    assert!(commands.len() >= 2);
+}
+
+#[tokio::test]
+async fn test_persistence_with_expire() {
+    use std::fs;
+    use std::sync::Arc;
+    use velodb::store::Store;
+    use velodb::persist::rdb;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir().unwrap();
+    let rdb_path = dir.path().join("dump.rdb");
+    let store = Arc::new(Store::new(1));
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+    store.set(0, b"k1", b"v1", Some(now + 100000)).unwrap();
+
+    rdb::save_rdb(&store, &rdb_path, 1).unwrap();
+
+    let fresh = Arc::new(Store::new(1));
+    rdb::load_rdb(&fresh, &rdb_path).unwrap();
+    assert!(fresh.exists(0, b"k1").unwrap());
+}
+
+#[tokio::test]
+async fn test_aof_logging_on_write() {
+    use std::fs;
+    use std::sync::Arc;
+    use velodb::store::Store;
+    use velodb::persist::aof::{AofWriter, FsyncPolicy, encode_command_for_aof};
+
+    let dir = tempfile::tempdir().unwrap();
+    let aof_path = dir.path().join("write_test.aof");
+    let aof = Arc::new(AofWriter::open(aof_path.clone(), FsyncPolicy::Always).unwrap());
+
+    let store = Arc::new(Store::new(1));
+    store.set(0, b"key", b"val", None).unwrap();
+    aof.append(&encode_command_for_aof(&[b"SET".to_vec(), b"key".to_vec(), b"val".to_vec()])).unwrap();
+    aof.sync().unwrap();
+
+    let content = fs::read_to_string(&aof_path).unwrap();
+    assert!(content.contains("SET"));
+    assert!(content.contains("key"));
+    assert!(content.contains("val"));
+}
+

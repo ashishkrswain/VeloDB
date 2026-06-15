@@ -8,6 +8,7 @@ mod net;
 mod cmd;
 mod store;
 mod server;
+mod persist;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};

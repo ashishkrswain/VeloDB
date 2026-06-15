@@ -8,6 +8,20 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **AOF persistence**: RESP-format append-only file logging with three fsync policies (no, everysec, always), background fsync task, and server startup replay
+- **RDB persistence**: Binary snapshot format (VELO magic, CRC64), save/load with full support for all 7 data types (String, List, Set, Hash, ZSet, Stream, NestedHash) and expiry timestamps
+- **BGSAVE**: Background RDB save via `tokio::task::spawn_blocking`, writes to temp file then atomically renames
+- **Auto-save**: Configurable periodic RDB snapshots via `save <seconds> <changes>` configuration
+- **Server startup persistence**: RDB loads on startup (takes priority over AOF), AOF replays if no RDB and `appendonly yes`
+- **AOF command logging**: All write commands (SET, LPUSH, SADD, HSET, ZADD, XADD, NHSEt, etc.) automatically append to AOF buffer
+- **4 new ServerConfig fields**: `appendonly`, `appendfsync`, `save` (vector of (seconds, changes) tuples)
+- **2 new VeloDBError variants**: `AofError`, `RdbError`
+- **`Store::iterate_db()`**: Iterates all non-expired entries per database for RDB serialization
+- **`Store::set_with_entry()`**: Direct entry insertion for RDB loading
+- **4 new integration tests**: RDB save/load roundtrip, AOF append/replay, persistence with expiry, AOF logging on write
+- **`tempfile` dev-dependency** for test temporary directories
+
+### Added
 - **Comprehensive test suite**: 143 tests covering store, parser, serializer, config, commands, and TCP integration
 - **Unit tests**: 116 tests across store/memory (86), RESP parser (15), RESP serializer (8), and config (7)
 - **Integration tests**: 27 end-to-end TCP roundtrip tests covering all 6 data types, expiry, pipelining, error responses, SELECT isolation, and WRONGTYPE enforcement

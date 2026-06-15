@@ -26,6 +26,10 @@ pub enum VeloDBError {
     MinOrMaxNotValidFloat,
     #[error("ERR The ID specified in XADD is equal or smaller than the target stream top item")]
     StreamIDTooSmall,
+    #[error("ERR AOF error: {0}")]
+    AofError(String),
+    #[error("ERR RDB error: {0}")]
+    RdbError(String),
     #[error("ERR protocol error: {0}")]
     ProtocolError(String),
     #[error("{0}")]

@@ -8,3 +8,4 @@ pub mod net;
 pub mod cmd;
 pub mod store;
 pub mod server;
+pub mod persist;

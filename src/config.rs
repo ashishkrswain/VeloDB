@@ -15,6 +15,9 @@ pub struct ServerConfig {
     pub loglevel: String,
     pub dbfilename: String,
     pub dir: String,
+    pub appendonly: bool,
+    pub appendfsync: String,
+    pub save: Vec<(u64, u64)>,
 }
 
 impl Default for ServerConfig {
@@ -23,6 +26,7 @@ impl Default for ServerConfig {
             port: 6379, bind_address: "127.0.0.1".into(), timeout: 0,
             tcp_keepalive: 300, databases: 16, maxmemory: 0,
             loglevel: "notice".into(), dbfilename: "dump.rdb".into(), dir: "./".into(),
+            appendonly: false, appendfsync: "everysec".into(), save: vec![],
         }
     }
 }
@@ -55,6 +59,16 @@ fn parse_redis_config(content: &str) -> anyhow::Result<ServerConfig> {
             "loglevel" => config.loglevel = value.to_string(),
             "dbfilename" => config.dbfilename = value.to_string(),
             "dir" => config.dir = value.to_string(),
+            "appendonly" => config.appendonly = value.eq_ignore_ascii_case("yes"),
+            "appendfsync" => config.appendfsync = value.to_string(),
+            "save" => {
+                let parts: Vec<&str> = value.splitn(2, ' ').collect();
+                if parts.len() == 2 {
+                    if let (Ok(secs), Ok(changes)) = (parts[0].parse(), parts[1].parse()) {
+                        config.save.push((secs, changes));
+                    }
+                }
+            }
             _ => {}
         }
     }
