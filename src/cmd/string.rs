@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use super::CommandDef;
 use crate::store::Store;
 use crate::resp::RespValue;

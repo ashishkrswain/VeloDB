@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use super::RespValue;
 
 pub fn serialize_response(value: &RespValue) -> Vec<u8> {

@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 mod server;
 mod string;
 mod generic;

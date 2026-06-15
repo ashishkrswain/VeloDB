@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2025-Present VeloDB Contributors -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # App Flow — VeloDB Rewrite
 
 ## 1. Server Startup Flow

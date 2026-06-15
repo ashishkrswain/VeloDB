@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2025-Present VeloDB Contributors -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Implementation Plan — VeloDB Rewrite
 
 ## Phase Overview

@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum RespValue {
     SimpleString(String),

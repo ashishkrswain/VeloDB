@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use nom::IResult;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take, take_while_m_n};

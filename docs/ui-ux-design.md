@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2025-Present VeloDB Contributors -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # UI/UX Design — VeloDB Rewrite
 
 ## 1. Overview

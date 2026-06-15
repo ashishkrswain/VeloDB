@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use dashmap::DashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Result, VeloDBError};
@@ -67,7 +70,6 @@ impl Store {
         let mut count = 0;
         let mut to_remove = Vec::new();
         for e in db.iter() { if Self::expired(&e) { to_remove.push(e.key().clone()); } else { count += 1; } }
-        drop(db);
         for k in to_remove { self.db(db_idx)?.remove(&k); }
         Ok(count)
     }

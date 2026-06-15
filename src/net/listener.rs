@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use tokio::net::TcpListener;
 use std::sync::Arc;
 use crate::store::Store;

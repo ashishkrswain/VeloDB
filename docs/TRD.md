@@ -1,3 +1,6 @@
+<!-- Copyright (c) 2025-Present VeloDB Contributors -->
+<!-- SPDX-License-Identifier: MIT -->
+
 # Technical Requirements Document — VeloDB Rewrite
 
 ## 1. Technology Stack

@@ -1,6 +1,10 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
+#[allow(dead_code)]
 pub enum VeloDBError {
     #[error("ERR unknown command '{0}'")]
     UnknownCommand(String),

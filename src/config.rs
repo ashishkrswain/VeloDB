@@ -1,3 +1,6 @@
+// Copyright (c) 2025-Present VeloDB Contributors
+// SPDX-License-Identifier: MIT
+
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
