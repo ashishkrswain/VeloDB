@@ -7,13 +7,102 @@
 
 ---
 
-## The Vision
+## What Is VeloDB?
 
-Redis changed how we think about data — sub-millisecond access, rich data structures, dead-simple operations. But it's running on an architecture designed in 2009: single-threaded C, limited multi-core scaling, a clustering protocol held together with gossip and hope.
+VeloDB is a **high-performance, multi-model, in-memory database server** that speaks the Redis protocol natively. Fire up any Redis client, point it at VeloDB, and everything just works — but underneath, everything is different.
 
-**VeloDB is the answer to a simple question: what if we rebuilt Redis from scratch, today, with everything we've learned?**
+Think of it as Redis rebuilt from the metal up: same familiar commands and wire format, but running on a modern Rust engine with lock-free concurrency, pluggable storage backends, and a clean-room implementation that inherits none of the original C codebase's limitations.
 
-No inherited C bugs. No single-threaded bottleneck. No bolted-on clustering. Just a clean-sheet design for the hardware and workloads of 2025 and beyond.
+### How It Works: A Request's Journey
+
+When a client connects and sends `SET mykey "hello"`, here's exactly what happens inside VeloDB:
+
+```
+1. TCP ACCEPT
+   tokio's async runtime accepts the connection on port 6379
+   and spawns a dedicated green thread (task) for this client.
+   No thread pools, no blocking — pure async I/O.
+
+2. STREAMING RESP2 PARSER
+   Bytes arrive into a BytesMut buffer (4KB initial, grows dynamically).
+   VeloDB's nom-based parser reads the wire protocol byte-by-byte:
+     *3\r\n$3\r\nSET\r\n$5\r\nmykey\r\n$5\r\nhello\r\n
+   The parser is streaming — it handles partial reads naturally,
+   returning "Incomplete, give me more data" when a command is
+   split across TCP packets. No wasted CPU spinning on incomplete frames.
+
+3. COMMAND DISPATCH
+   The parser extracts the command name ("SET") and arguments
+   (["mykey", "hello"]). A HashMap<String, CommandDef> lookup finds
+   the handler function in O(1). Arity validation runs — wrong number
+   of arguments returns an error immediately, before touching any data.
+
+4. COMMAND EXECUTION
+   The SET handler processes optional flags (EX, PX, NX, XX, etc.),
+   calculates absolute expiry timestamps if needed, then calls into
+   the storage layer.
+
+5. STORAGE: LOCK-FREE CONCURRENT HASHMAP
+   The Store holds 16 databases (configurable), each backed by a
+   DashMap — a sharded, lock-free concurrent hashmap. Each database
+   shard owns its stripe of keys independently. No global mutex.
+   No contention between clients writing to different keys.
+
+   Every entry stores:
+   - A StorageValue enum (String, List, Set, Hash, ZSet, Stream, NestedHash)
+   - An optional expire_at timestamp (passive expiry: checked on access)
+   - A version counter (for WATCH/MULTI/EXEC optimistic locking)
+
+   The ZSet uses a dual-index: HashMap<member, score> for O(1) lookups
+   and BTreeMap<score, members> for ordered range queries.
+   Zero-copy where possible — DashMap references avoid cloning until write.
+
+6. AOF PERSISTENCE (if enabled)
+   Before responding to the client, the raw command bytes are appended
+   to the Append-Only File. Fsync policy controls durability:
+   - "no": write to OS buffer, let the kernel decide
+   - "everysec": background tokio task fsyncs every 1 second
+   - "always": fsync before responding (slowest, safest)
+
+7. BLOCKING OPERATIONS
+   If the command was BLPOP on an empty list, VeloDB doesn't spin.
+   The connection registers a tokio::Notify on the key via the
+   BlockRegistry, then parks. When another connection LPUSHes to
+   that key, the notify fires, the blocked connection wakes up,
+   pops the value, and responds. Timeouts use tokio::select! for
+   race-free cancellation.
+
+8. PUB/SUB MESSAGE DELIVERY
+   When a client runs SUBSCRIBE news, VeloDB registers an mpsc
+   unbounded sender in the PubSubRegistry. The connection enters
+   "pubsub mode" — a select loop monitoring both the TCP socket
+   and the message channel. PUBLISH fans out through exact channel
+   matching AND glob pattern matching (PSUBSCRIBE), using the same
+   glob engine as KEYS.
+
+9. RESPONSE SERIALIZATION
+   The command handler returns a RespValue enum. The serializer
+   walks the tree and emits wire-format bytes with proper \r\n
+   termination. The response is written to the TCP socket via
+   write_all — tokio handles the async I/O under the hood.
+
+10. CONNECTION LIFECYCLE
+    The connection loop continues: read → parse → dispatch → write.
+    Pipelining is supported — multiple commands in one TCP packet
+    are processed sequentially before the next read.
+    The entire system is single-threaded per connection but
+    multi-connection via tokio's work-stealing scheduler.
+```
+
+### What Makes It Different
+
+**Zero unsafe code in the hot path.** The RESP parser, command dispatch, storage engine, and network layer are all safe Rust. The compiler guarantees no data races, no use-after-free, no buffer overruns at the type level. Your database doesn't segfault.
+
+**Lock-free everywhere.** DashMap shards keys internally. BlockRegistry uses atomic operations and tokio::Notify. PubSubRegistry uses mpsc channels. There is not a single Mutex on the critical path from client request to response.
+
+**Batteries included.** Persistence (AOF + RDB snapshot), blocking operations (BLPOP with timeouts), transactions (MULTI/EXEC with WATCH), and Pub/Sub — all built in from the start, not bolted on later.
+
+**Extensible by design.** The StorageValue enum makes adding a new data type a matter of defining the variant, adding Store methods, and writing command handlers. The CommandTable registry turns adding a new command into a three-line registration.
 
 ---
 
