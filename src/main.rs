@@ -11,6 +11,7 @@ mod server;
 mod persist;
 mod replication;
 mod shard;
+mod cluster;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};

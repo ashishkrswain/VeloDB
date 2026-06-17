@@ -11,3 +11,4 @@ pub mod server;
 pub mod persist;
 pub mod replication;
 pub mod shard;
+pub mod cluster;

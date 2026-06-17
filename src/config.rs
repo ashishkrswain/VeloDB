@@ -22,6 +22,10 @@ pub struct ServerConfig {
     pub masterauth: Option<String>,
     pub repl_backlog_size: usize,
     pub cthreads: usize,
+    pub cluster_enabled: bool,
+    pub cluster_port: u16,
+    pub cluster_node_timeout: u64,
+    pub cluster_config_file: String,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +37,7 @@ impl Default for ServerConfig {
             appendonly: false, appendfsync: "everysec".into(), save: vec![],
             replicaof: None, masterauth: None, repl_backlog_size: 1048576,
             cthreads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
+            cluster_enabled: false, cluster_port: 16379, cluster_node_timeout: 15000, cluster_config_file: "nodes.conf".into(),
         }
     }
 }

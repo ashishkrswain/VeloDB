@@ -13,6 +13,7 @@ mod nested_hash;
 mod pubsub;
 mod transaction;
 mod lua;
+mod cluster;
 
 use std::collections::HashMap;
 use crate::store::Store;
@@ -44,6 +45,7 @@ impl CommandTable {
         table.register(pubsub::COMMANDS);
         table.register(transaction::COMMANDS);
         table.register(lua::COMMANDS);
+        table.register(cluster::COMMANDS);
         table
     }
 

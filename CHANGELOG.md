@@ -8,6 +8,19 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Cluster support (Phase 6)**: Redis Cluster API compatibility layer with slot-to-node mapping
+- **SlotMap**: 16384-slot allocation with Assigned/Migrating/Importing/Unassigned states
+- **CLUSTER commands**: SLOTS, NODES, INFO, MYID, KEYSLOT, MEET, RESET, FORGET, REPLICATE, SETSLOT, GETKEYSINSLOT, COUNTKEYSINSLOT, SAVECONFIG
+- **Cluster bus**: Background TCP listener on cluster_port for inter-node communication
+- **MOVED/ASK redirect support**: Slot ownership check with proper RESP error responses
+- **Cluster config**: `cluster-enabled`, `cluster-port`, `cluster-node-timeout`, `cluster-config-file` fields
+- **New modules**: `src/cluster/` (slots, compat), `src/cmd/cluster.rs`
+
+### Changed
+- **Server startup**: Starts cluster bus service when `cluster-enabled yes` is configured
+- **Command table**: Registered 13 new CLUSTER subcommands
+
+### Added
 - **Lua Scripting**: EVAL, EVALSHA, SCRIPT LOAD/EXISTS/FLUSH commands with mlua sandbox
 - **redis.call() bridge**: Lua scripts can call Redis commands (SET, GET, DEL, etc.) through dispatch
 - **KEYS/ARGV arrays**: Passed as Lua tables accessible from scripts

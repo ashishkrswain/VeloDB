@@ -109,6 +109,17 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     );
     tracing::info!("{} shard runtimes started", config.cthreads);
 
+    // Cluster: start cluster bus if enabled
+    if config.cluster_enabled {
+        let node_id = format!("{:040x}", rand::random::<u128>());
+        let node_addr = format!("{}:{}", config.bind_address, config.port);
+        let cluster_state = Arc::new(std::sync::RwLock::new(
+            crate::cluster::slots::ClusterState::new(node_id.clone(), node_addr, config.cluster_port)
+        ));
+        crate::cluster::slots::start_cluster_service(cluster_state);
+        tracing::info!("Cluster mode enabled, node ID: {}", node_id);
+    }
+
     // Accept loop
     tokio::select! {
         result = sharded.accept_loop(listener) => result?,
