@@ -36,6 +36,8 @@ pub enum VeloDBError {
     ProtocolError(String),
     #[error("{0}")]
     Io(#[from] std::io::Error),
+    #[error("Lua error: {0}")]
+    Lua(String),
     #[error("{0}")]
     Internal(String),
 }

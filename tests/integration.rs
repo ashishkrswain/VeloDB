@@ -646,6 +646,125 @@ async fn test_discard() {
     let resp = send_cmd(&mut stream, &["GET", "x"]).await;
     assert!(String::from_utf8_lossy(&resp).contains("$-1"));
 }
+
+// ========= Lua Scripting tests =========
+#[tokio::test]
+async fn test_eval_return_int() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["EVAL", "return 42", "0"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains(":42"));
+}
+
+#[tokio::test]
+async fn test_eval_return_string() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["EVAL", "return 'hello'", "0"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("hello"));
+}
+
+#[tokio::test]
+async fn test_eval_with_keys_and_args() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    // Lua with KEYS array access (index is 1-based in Lua)
+    let resp = send_cmd(&mut stream, &["EVAL", "return KEYS[1] .. ARGV[1]", "1", "key1", "arg1"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("key1arg1"));
+}
+
+#[tokio::test]
+async fn test_eval_return_table() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["EVAL", "return {1, 2, 3}", "0"]).await;
+    // Table responses come back as +OK from lua_to_resp
+    assert!(String::from_utf8_lossy(&resp).contains("+OK"));
+}
+
+#[tokio::test]
+async fn test_eval_error() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["EVAL", "error('oops')", "0"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("ERR"));
+}
+
+#[tokio::test]
+async fn test_script_load_exists_flush() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["SCRIPT", "LOAD", "return 42"]).await;
+    let s = String::from_utf8_lossy(&resp);
+    // Extract SHA from bulk string response: $40\r\n<sha>\r\n
+    let sha: String = s.lines()
+        .filter(|l| !l.starts_with('$') && !l.is_empty())
+        .next()
+        .unwrap_or("")
+        .to_string();
+    assert!(!sha.is_empty());
+
+    let resp = send_cmd(&mut stream, &["SCRIPT", "EXISTS", &sha]).await;
+    assert!(String::from_utf8_lossy(&resp).contains(":1"));
+
+    let resp = send_cmd(&mut stream, &["SCRIPT", "FLUSH"]).await;
+    assert!(String::from_utf8_lossy(&resp).contains("OK"));
+
+    let resp = send_cmd(&mut stream, &["SCRIPT", "EXISTS", &sha]).await;
+    assert!(String::from_utf8_lossy(&resp).contains(":0"));
+}
+
+#[tokio::test]
+async fn test_info_command() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["INFO"]).await;
+    let s = String::from_utf8_lossy(&resp);
+    assert!(s.contains("velodb_version"));
+    assert!(s.contains("uptime_in_seconds"));
+}
+
+#[tokio::test]
+async fn test_config_get() {
+    let port = find_free_port();
+    let handle = spawn_server(port).await;
+    tokio::spawn(async move { handle.accept_loop().await.unwrap() });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).await.unwrap();
+    let resp = send_cmd(&mut stream, &["CONFIG", "GET", "*"]).await;
+    let s = String::from_utf8_lossy(&resp);
+    assert!(s.contains("port"));
+    assert!(s.contains("databases"));
+}
 #[tokio::test]
 async fn test_rdb_save_and_load() {
     use std::fs;

@@ -108,6 +108,7 @@ pub struct Store {
     pub databases: Vec<DashMap<Vec<u8>, Entry>>,
     pub block_registry: BlockRegistry,
     pub pubsub_registry: PubSubRegistry,
+    pub lua_scripts: dashmap::DashMap<String, String>,
 }
 
 pub struct PubSubRegistry {
@@ -182,7 +183,7 @@ fn count_entries(_ch: &[u8]) -> Option<usize> { None }
 
 impl Store {
     pub fn new(num: usize) -> Self {
-        Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new(), pubsub_registry: PubSubRegistry::new() }
+        Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new(), pubsub_registry: PubSubRegistry::new(), lua_scripts: dashmap::DashMap::new() }
     }
 
     fn db(&self, idx: usize) -> Result<&DashMap<Vec<u8>, Entry>> {

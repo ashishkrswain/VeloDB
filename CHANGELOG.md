@@ -8,6 +8,21 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Lua Scripting**: EVAL, EVALSHA, SCRIPT LOAD/EXISTS/FLUSH commands with mlua sandbox
+- **redis.call() bridge**: Lua scripts can call Redis commands (SET, GET, DEL, etc.) through dispatch
+- **KEYS/ARGV arrays**: Passed as Lua tables accessible from scripts
+- **Script cache**: SHA1-hashed script storage in DashMap on Store
+- **INFO command**: Returns proper multi-line bulk string with version, uptime, keyspace stats
+- **CONFIG GET/SET**: Runtime configuration introspection (stub implementation)
+- **8 new integration tests**: EVAL return int/string/table/error/pipelined, SCRIPT load/exists/flush, INFO, CONFIG GET
+- **mlua + sha1 dependencies** for Lua scripting engine
+
+### Changed
+- **cmd/server.rs**: Added INFO and CONFIG commands, replaced stub implementations
+- **Store struct**: Added `lua_scripts: DashMap<String, String>` for script caching
+- **Error enum**: Added `Lua(String)` variant for Lua error reporting
+
+### Added
 - **Multi-Threading (Phase 4)**: Thread-per-core sharded server architecture with N tokio runtimes
 - **ShardedServer**: Round-robin connection routing to shard runtimes, mpsc channel-based forwarding
 - **Slot Router**: CRC16-based key hashing with hashtag extraction support (`{...}`)
