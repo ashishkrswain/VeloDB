@@ -3,9 +3,10 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
 use crate::config::ServerConfig;
-use crate::net::listener::ServerHandle;
 use crate::store::Store;
+use crate::cmd::CommandTable;
 use crate::persist::aof::{AofWriter, FsyncPolicy, start_fsync_task};
 use crate::persist::rdb;
 use crate::replication::backlog::ReplBacklog;
@@ -72,7 +73,7 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         let master_host = parts[0].to_string();
         let master_port: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
         let repl_store = store.clone();
-        let cmd_table = Arc::new(crate::cmd::CommandTable::new());
+        let cmd_table = Arc::new(CommandTable::new());
         let host = master_host.clone();
         tokio::spawn(async move {
             tracing::info!("Replica connecting to master at {}:{}", host, master_port);
@@ -88,13 +89,29 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         });
     }
 
-    let handle = ServerHandle::new(&config, store.clone(), aof_writer, replid, Some(repl_backlog)).await?;
-    tracing::info!("VeloDB server listening on {}:{}", config.bind_address, config.port);
-    tracing::info!("Master replication ID: {}", handle.replid);
-    tracing::info!("Ready to accept connections");
+    // Bind listener
+    let addr = format!("{}:{}", config.bind_address, config.port);
+    let listener = TcpListener::bind(&addr).await?;
+    tracing::info!("VeloDB server listening on {}", addr);
+    tracing::info!("Master replication ID: {}", replid);
+    tracing::info!("Starting with {} worker threads", config.cthreads);
 
+    // Create sharded server
+    let cmd_table = Arc::new(CommandTable::new());
+    let sharded = crate::shard::ShardedServer::new(
+        config.cthreads,
+        store.clone(),
+        cmd_table,
+        &config,
+        aof_writer,
+        repl_backlog.clone(),
+        &replid,
+    );
+    tracing::info!("{} shard runtimes started", config.cthreads);
+
+    // Accept loop
     tokio::select! {
-        result = handle.accept_loop() => result?,
+        result = sharded.accept_loop(listener) => result?,
         _ = tokio::signal::ctrl_c() => tracing::info!("SIGINT received, shutting down"),
     }
 

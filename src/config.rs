@@ -21,6 +21,7 @@ pub struct ServerConfig {
     pub replicaof: Option<String>,
     pub masterauth: Option<String>,
     pub repl_backlog_size: usize,
+    pub cthreads: usize,
 }
 
 impl Default for ServerConfig {
@@ -31,6 +32,7 @@ impl Default for ServerConfig {
             loglevel: "notice".into(), dbfilename: "dump.rdb".into(), dir: "./".into(),
             appendonly: false, appendfsync: "everysec".into(), save: vec![],
             replicaof: None, masterauth: None, repl_backlog_size: 1048576,
+            cthreads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
         }
     }
 }

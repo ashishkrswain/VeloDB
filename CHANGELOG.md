@@ -8,6 +8,19 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Multi-Threading (Phase 4)**: Thread-per-core sharded server architecture with N tokio runtimes
+- **ShardedServer**: Round-robin connection routing to shard runtimes, mpsc channel-based forwarding
+- **Slot Router**: CRC16-based key hashing with hashtag extraction support (`{...}`)
+- **Shard per core**: Each shard runs on a dedicated OS thread with its own tokio runtime
+- **Config field**: `cthreads` (default: available_parallelism cores)
+- **New modules**: `src/shard/` (mod, router with hashtag + CRC16)
+- **3 slot router unit tests**: hashtag extraction, same-slot verification, SLOT_COUNT bounds
+
+### Changed
+- **Server startup**: Replaced single-threaded ServerHandle with ShardedServer 
+- **Main event loop**: All share a single TCP listener, connections routed to shard runtimes
+
+### Added
 - **Replication framework**: PSYNC protocol support, ReplBacklog ring buffer, master/replica handshake
 - **Master-side replication**: PSYNC negotiation (full and partial sync), RDB snapshot transfer, command streaming from backlog
 - **Replica-side replication**: Master connection, full RDB sync reception/loading, command stream replay

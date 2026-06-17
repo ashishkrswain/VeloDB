@@ -10,6 +10,7 @@ mod store;
 mod server;
 mod persist;
 mod replication;
+mod shard;
 
 use clap::Parser;
 use tracing_subscriber::{fmt, EnvFilter};
