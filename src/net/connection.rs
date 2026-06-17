@@ -12,6 +12,7 @@ use crate::resp::{self, RespValue};
 use crate::config::ServerConfig;
 use crate::error::VeloDBError;
 use crate::persist::aof::{AofWriter, encode_command_for_aof};
+use crate::replication::backlog::ReplBacklog;
 
 const MAX_QUERY_BUFFER: usize = 1024 * 1024 * 1024;
 
@@ -52,6 +53,7 @@ pub async fn handle(
     cmd_table: Arc<CommandTable>,
     _config: ServerConfig,
     aof_writer: Option<Arc<AofWriter>>,
+    repl_backlog: Option<Arc<std::sync::Mutex<ReplBacklog>>>,
 ) -> anyhow::Result<()> {
     let mut buf = bytes::BytesMut::with_capacity(4096);
     let mut ctx = ClientContext::new();
@@ -119,6 +121,14 @@ pub async fn handle(
                                 if is_write_command(&cmd_name) {
                                     let aof_entry = encode_command_for_aof(&args);
                                     let _ = aof.append(&aof_entry);
+                                }
+                            }
+
+                            // Replication backlog
+                            if let Some(ref bl) = repl_backlog {
+                                if is_write_command(&cmd_name) {
+                                    let cmd_bytes = encode_command_for_aof(&args);
+                                    bl.lock().unwrap().push(&cmd_bytes);
                                 }
                             }
 

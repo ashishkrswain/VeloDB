@@ -9,3 +9,4 @@ pub mod cmd;
 pub mod store;
 pub mod server;
 pub mod persist;
+pub mod replication;

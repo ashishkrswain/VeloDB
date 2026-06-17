@@ -8,6 +8,21 @@ All notable changes to VeloDB are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Replication framework**: PSYNC protocol support, ReplBacklog ring buffer, master/replica handshake
+- **Master-side replication**: PSYNC negotiation (full and partial sync), RDB snapshot transfer, command streaming from backlog
+- **Replica-side replication**: Master connection, full RDB sync reception/loading, command stream replay
+- **Replication backlog**: Ring buffer storing raw RESP commands, configurable size (default 1MB), offset-based partial sync
+- **Replid generation**: 40-char hex random replication ID per server instance
+- **Config fields**: `replicaof` (master host:port), `masterauth`, `repl-backlog-size`
+- **New modules**: `src/replication/` (backlog, master, replica)
+- **`rand` dependency** for replication ID generation
+
+### Changed
+- **ServerHandle**: Added `repl_backlog` and `replid` fields for replication support
+- **Connection handler**: Commands appended to replication backlog after dispatch
+- **Server startup**: Spawns replica connection task if `replicaof` is configured, with auto-reconnect loop
+
+### Added
 - **Pub/Sub system**: SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH with channel and pattern matching support
 - **Transactions**: MULTI, EXEC, DISCARD, WATCH, UNWATCH with atomic execution and WATCH-based optimistic locking
 - **PubSubRegistry**: DashMap-based channel/pattern registry with mpsc channels for real-time message delivery

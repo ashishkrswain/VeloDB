@@ -18,6 +18,9 @@ pub struct ServerConfig {
     pub appendonly: bool,
     pub appendfsync: String,
     pub save: Vec<(u64, u64)>,
+    pub replicaof: Option<String>,
+    pub masterauth: Option<String>,
+    pub repl_backlog_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -27,6 +30,7 @@ impl Default for ServerConfig {
             tcp_keepalive: 300, databases: 16, maxmemory: 0,
             loglevel: "notice".into(), dbfilename: "dump.rdb".into(), dir: "./".into(),
             appendonly: false, appendfsync: "everysec".into(), save: vec![],
+            replicaof: None, masterauth: None, repl_backlog_size: 1048576,
         }
     }
 }
@@ -69,6 +73,9 @@ fn parse_redis_config(content: &str) -> anyhow::Result<ServerConfig> {
                     }
                 }
             }
+            "replicaof" => config.replicaof = Some(value.to_string()),
+            "masterauth" => config.masterauth = Some(value.to_string()),
+            "repl-backlog-size" => { if let Ok(sz) = value.parse() { config.repl_backlog_size = sz; } }
             _ => {}
         }
     }

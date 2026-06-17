@@ -3,6 +3,7 @@
 
 use tokio::net::TcpStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
 use velodb::net::listener::ServerHandle;
 use velodb::config::ServerConfig;
 
@@ -48,7 +49,9 @@ async fn spawn_server(port: u16) -> ServerHandle {
     config.port = port;
     config.databases = 4;
     let store = std::sync::Arc::new(velodb::store::Store::new(config.databases));
-    ServerHandle::new(&config, store, None).await.unwrap()
+    let replid = velodb::replication::backlog::ReplicationState::new().replid;
+    let repl_backlog = Arc::new(std::sync::Mutex::new(velodb::replication::backlog::ReplBacklog::new(1048576)));
+    ServerHandle::new(&config, store, None, replid, Some(repl_backlog)).await.unwrap()
 }
 
 // ========= String Commands =========

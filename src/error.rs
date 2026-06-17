@@ -30,6 +30,8 @@ pub enum VeloDBError {
     AofError(String),
     #[error("ERR RDB error: {0}")]
     RdbError(String),
+    #[error("ERR replication error: {0}")]
+    ReplError(String),
     #[error("ERR protocol error: {0}")]
     ProtocolError(String),
     #[error("{0}")]

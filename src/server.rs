@@ -8,9 +8,12 @@ use crate::net::listener::ServerHandle;
 use crate::store::Store;
 use crate::persist::aof::{AofWriter, FsyncPolicy, start_fsync_task};
 use crate::persist::rdb;
+use crate::replication::backlog::ReplBacklog;
 
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let store = Arc::new(Store::new(config.databases));
+    let replid = crate::replication::backlog::ReplicationState::new().replid;
+    let repl_backlog = Arc::new(std::sync::Mutex::new(ReplBacklog::new(config.repl_backlog_size)));
 
     // Try to load from persistence
     let rdb_path = PathBuf::from(format!("{}/{}", config.dir, config.dbfilename));
@@ -63,8 +66,31 @@ pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
         });
     }
 
-    let handle = ServerHandle::new(&config, store.clone(), aof_writer).await?;
+    // Replication: start as replica if configured
+    if let Some(ref replicaof) = config.replicaof {
+        let parts: Vec<&str> = replicaof.splitn(2, ' ').collect();
+        let master_host = parts[0].to_string();
+        let master_port: u16 = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(6379);
+        let repl_store = store.clone();
+        let cmd_table = Arc::new(crate::cmd::CommandTable::new());
+        let host = master_host.clone();
+        tokio::spawn(async move {
+            tracing::info!("Replica connecting to master at {}:{}", host, master_port);
+            loop {
+                match crate::replication::replica::connect_to_master(repl_store.clone(), cmd_table.clone(), &host, master_port).await {
+                    Ok(()) => tracing::info!("Replication connection closed"),
+                    Err(e) => {
+                        tracing::warn!("Replication connection failed: {}, retrying in 5s", e);
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+    }
+
+    let handle = ServerHandle::new(&config, store.clone(), aof_writer, replid, Some(repl_backlog)).await?;
     tracing::info!("VeloDB server listening on {}:{}", config.bind_address, config.port);
+    tracing::info!("Master replication ID: {}", handle.replid);
     tracing::info!("Ready to accept connections");
 
     tokio::select! {
