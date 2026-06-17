@@ -17,13 +17,12 @@ pub enum FsyncPolicy {
 pub struct AofWriter {
     file: Mutex<File>,
     policy: FsyncPolicy,
-    pub path: PathBuf,
 }
 
 impl AofWriter {
     pub fn open(path: PathBuf, policy: FsyncPolicy) -> std::io::Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { file: Mutex::new(file), policy, path })
+        Ok(Self { file: Mutex::new(file), policy })
     }
 
     pub fn append(&self, data: &[u8]) -> std::io::Result<()> {

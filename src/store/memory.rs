@@ -179,8 +179,6 @@ impl PubSubRegistry {
     }
 }
 
-fn count_entries(_ch: &[u8]) -> Option<usize> { None }
-
 impl Store {
     pub fn new(num: usize) -> Self {
         Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new(), pubsub_registry: PubSubRegistry::new(), lua_scripts: dashmap::DashMap::new() }

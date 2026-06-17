@@ -27,7 +27,7 @@ pub async fn connect_to_master(
     let n = socket.read(&mut resp_buf).await?;
     let response = String::from_utf8_lossy(&resp_buf[..n]);
 
-    let mut replid = String::new();
+    let mut _replid = String::new();
 
     if response.starts_with("+FULLRESYNC") {
         // Parse replid and offset
@@ -36,7 +36,7 @@ pub async fn connect_to_master(
             if line.starts_with('+') {
                 let parts: Vec<&str> = line[1..].split(' ').collect();
                 if parts.len() >= 3 && parts[0] == "FULLRESYNC" {
-                    replid = parts[1].to_string();
+                    let _replid_val = parts[1].to_string();
                 }
             }
         }

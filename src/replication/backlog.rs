@@ -1,7 +1,6 @@
 // Copyright (c) 2025-Present VeloDB Contributors
 // SPDX-License-Identifier: MIT
 
-use std::sync::Mutex;
 use rand::Rng;
 
 pub struct ReplBacklog {
