@@ -32,6 +32,8 @@ fn get(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error
 
 fn set(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error::Result<RespValue> {
     let mut expire_ms: Option<u64> = None;
+    let mut nx = false;
+    let mut xx = false;
     let flag_args = &args[2..];
     let mut i = 0;
     while i < flag_args.len() {
@@ -56,7 +58,15 @@ fn set(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error
                 }
                 i += 2;
             }
+            "NX" => { nx = true; i += 1; }
+            "XX" => { xx = true; i += 1; }
             _ => i += 1,
+        }
+    }
+    if nx || xx {
+        let exists = store.exists(ctx.db_index, &args[0])?;
+        if (nx && exists) || (xx && !exists) {
+            return Ok(RespValue::nil());
         }
     }
     store.set(ctx.db_index, &args[0], &args[1], expire_ms)?;

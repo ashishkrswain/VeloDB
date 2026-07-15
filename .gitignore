@@ -1,3 +1,5 @@
 /target
 .commandcode/
 .COMMIT_MSG
+*.rdb
+*.aof

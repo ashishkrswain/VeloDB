@@ -287,7 +287,7 @@ pub async fn bgsave(store: Arc<Store>, config: &ServerConfig) -> std::io::Result
     let dir = config.dir.clone();
     let filename = config.dbfilename.clone();
     let num_dbs = store.databases.len();
-    let temp_path = PathBuf::from(format!("{}/temp-{}.rdb", dir, std::process::id()));
+    let temp_path = PathBuf::from(format!("{}/temp-{}-{}.rdb", dir, std::process::id(), crate::persist::unique_temp_id()));
     let final_path = PathBuf::from(format!("{}/{}", dir, filename));
 
     tokio::task::spawn_blocking(move || {

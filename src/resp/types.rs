@@ -8,6 +8,17 @@ pub enum RespValue {
     Integer(i64),
     BulkString(Option<Vec<u8>>),
     Array(Option<Vec<RespValue>>),
+    /// RESP3 map (`%`). Serializes as a flat interleaved Array under
+    /// RESP2, since RESP2 has no dedicated map type.
+    Map(Vec<(RespValue, RespValue)>),
+    /// RESP3 double (`,`). Serializes as a bulk string under RESP2.
+    Double(f64),
+    /// RESP3 boolean (`#`). Serializes as integer 0/1 under RESP2.
+    Boolean(bool),
+    /// RESP3's dedicated null type (`_`). Distinct from `BulkString(None)`
+    /// / `Array(None)` because RESP2 has no unified null — it serializes
+    /// as `$-1\r\n` there, matching Redis's own RESP2 fallback for `_`.
+    Null,
 }
 
 impl RespValue {

@@ -43,6 +43,7 @@ impl ShardedServer {
             let aw = aof_writer.clone();
             let bl = repl_backlog.clone();
             let rid = replid.to_string();
+            let cfg = config.clone();
 
             std::thread::spawn(move || {
                 let rt = tokio::runtime::Builder::new_current_thread()
@@ -58,8 +59,9 @@ impl ShardedServer {
                         let aof = aw.clone();
                         let backlog = bl.clone();
                         let rid_clone = rid.clone();
+                        let conn_cfg = cfg.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = connection::handle(socket, st, cmd, ServerConfig::default(), aof, Some(backlog)).await {
+                            if let Err(e) = connection::handle(socket, st, cmd, conn_cfg, aof, Some(backlog), rid_clone).await {
                                 tracing::warn!("Connection error from {}: {}", addr, e);
                             }
                         });

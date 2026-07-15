@@ -40,19 +40,22 @@ fn eval_cmd(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::
     let store_ptr = store as *const Store;
     let db_idx = ctx.db_index;
 
-    let call_fn = lua.create_function(move |lua_ctx, (_name, targs): (String, LuaValue)| {
-        let cmd_args = match targs {
-            LuaValue::Table(t) => {
-                let mut v = Vec::new();
-                let len = t.len().unwrap_or(0);
-                for i in 1..=len {
-                    if let Ok(s) = t.get::<String>(i) { v.push(s.as_bytes().to_vec()); }
-                }
-                v
+    // redis.call is variadic in the real Redis Lua API:
+    // redis.call("SET", "key", "value"). Numbers are accepted and
+    // coerced to strings, matching Redis.
+    let call_fn = lua.create_function(move |lua_ctx, args: mlua::Variadic<LuaValue>| {
+        let mut cmd_args: Vec<Vec<u8>> = Vec::with_capacity(args.len());
+        for arg in args.iter() {
+            match arg {
+                LuaValue::String(s) => cmd_args.push(s.as_bytes().to_vec()),
+                LuaValue::Integer(i) => cmd_args.push(i.to_string().into_bytes()),
+                LuaValue::Number(n) => cmd_args.push(n.to_string().into_bytes()),
+                _ => return Err(mlua::Error::RuntimeError("Lua redis.call() arguments must be strings or numbers".into())),
             }
-            _ => return Ok(LuaValue::Nil),
-        };
-        if cmd_args.is_empty() { return Ok(LuaValue::Nil); }
+        }
+        if cmd_args.is_empty() {
+            return Err(mlua::Error::RuntimeError("wrong number of arguments to redis.call()".into()));
+        }
         let cmd_name = String::from_utf8_lossy(&cmd_args[0]).to_uppercase();
         let store_ref = unsafe { &*store_ptr };
         let mut call_ctx = ClientContext { db_index: db_idx, ..ClientContext::new() };
@@ -90,6 +93,14 @@ fn resp_to_lua(lua_ctx: &Lua, val: &RespValue) -> mlua::Result<LuaValue> {
             Ok(LuaValue::Table(tbl))
         }
         RespValue::Array(None) => Ok(LuaValue::Boolean(false)),
+        RespValue::Map(pairs) => {
+            let tbl = lua_ctx.create_table()?;
+            for (k, v) in pairs { tbl.set(resp_to_lua(lua_ctx, k)?, resp_to_lua(lua_ctx, v)?)?; }
+            Ok(LuaValue::Table(tbl))
+        }
+        RespValue::Double(d) => Ok(LuaValue::Number(*d)),
+        RespValue::Boolean(b) => Ok(LuaValue::Boolean(*b)),
+        RespValue::Null => Ok(LuaValue::Boolean(false)),
     }
 }
 

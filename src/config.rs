@@ -12,6 +12,7 @@ pub struct ServerConfig {
     pub tcp_keepalive: u64,
     pub databases: usize,
     pub maxmemory: u64,
+    pub maxmemory_policy: String,
     pub loglevel: String,
     pub dbfilename: String,
     pub dir: String,
@@ -26,6 +27,10 @@ pub struct ServerConfig {
     pub cluster_port: u16,
     pub cluster_node_timeout: u64,
     pub cluster_config_file: String,
+    pub requirepass: Option<String>,
+    pub tls_port: u16,
+    pub tls_cert_file: Option<String>,
+    pub tls_key_file: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -33,11 +38,13 @@ impl Default for ServerConfig {
         Self {
             port: 6379, bind_address: "127.0.0.1".into(), timeout: 0,
             tcp_keepalive: 300, databases: 16, maxmemory: 0,
+            maxmemory_policy: "noeviction".into(),
             loglevel: "notice".into(), dbfilename: "dump.rdb".into(), dir: "./".into(),
             appendonly: false, appendfsync: "everysec".into(), save: vec![],
             replicaof: None, masterauth: None, repl_backlog_size: 1048576,
             cthreads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4),
             cluster_enabled: false, cluster_port: 16379, cluster_node_timeout: 15000, cluster_config_file: "nodes.conf".into(),
+            requirepass: None, tls_port: 0, tls_cert_file: None, tls_key_file: None,
         }
     }
 }
@@ -67,6 +74,8 @@ fn parse_redis_config(content: &str) -> anyhow::Result<ServerConfig> {
             "timeout" => config.timeout = value.parse()?,
             "tcp-keepalive" => config.tcp_keepalive = value.parse()?,
             "databases" => config.databases = value.parse()?,
+            "maxmemory" => config.maxmemory = parse_memory_size(value)?,
+            "maxmemory-policy" => config.maxmemory_policy = value.to_string(),
             "loglevel" => config.loglevel = value.to_string(),
             "dbfilename" => config.dbfilename = value.to_string(),
             "dir" => config.dir = value.to_string(),
@@ -83,10 +92,32 @@ fn parse_redis_config(content: &str) -> anyhow::Result<ServerConfig> {
             "replicaof" => config.replicaof = Some(value.to_string()),
             "masterauth" => config.masterauth = Some(value.to_string()),
             "repl-backlog-size" => { if let Ok(sz) = value.parse() { config.repl_backlog_size = sz; } }
+            "requirepass" => config.requirepass = if value.is_empty() { None } else { Some(value.to_string()) },
+            "tls-port" => config.tls_port = value.parse()?,
+            "tls-cert-file" => config.tls_cert_file = Some(value.to_string()),
+            "tls-key-file" => config.tls_key_file = Some(value.to_string()),
             _ => {}
         }
     }
     Ok(config)
+}
+
+/// Parses redis.conf memory sizes: plain bytes or kb/mb/gb suffixes
+/// (binary units, matching Redis's 1024-based kb/mb/gb).
+fn parse_memory_size(value: &str) -> anyhow::Result<u64> {
+    let v = value.trim().to_lowercase();
+    let (num, mult) = if let Some(n) = v.strip_suffix("gb") {
+        (n, 1024 * 1024 * 1024)
+    } else if let Some(n) = v.strip_suffix("mb") {
+        (n, 1024 * 1024)
+    } else if let Some(n) = v.strip_suffix("kb") {
+        (n, 1024)
+    } else if let Some(n) = v.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (v.as_str(), 1)
+    };
+    Ok(num.trim().parse::<u64>()? * mult)
 }
 
 #[cfg(test)]
@@ -129,6 +160,55 @@ mod tests {
         let input = "# this is a comment\n\nport 6390\n\n# another comment";
         let config = parse_redis_config(input).unwrap();
         assert_eq!(config.port, 6390);
+    }
+
+    #[test]
+    fn test_parse_maxmemory_plain_bytes() {
+        let config = parse_redis_config("maxmemory 104857600").unwrap();
+        assert_eq!(config.maxmemory, 104857600);
+    }
+
+    #[test]
+    fn test_parse_maxmemory_with_units() {
+        assert_eq!(parse_redis_config("maxmemory 100mb").unwrap().maxmemory, 100 * 1024 * 1024);
+        assert_eq!(parse_redis_config("maxmemory 2gb").unwrap().maxmemory, 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_redis_config("maxmemory 512kb").unwrap().maxmemory, 512 * 1024);
+    }
+
+    #[test]
+    fn test_parse_maxmemory_policy() {
+        let config = parse_redis_config("maxmemory-policy allkeys-random").unwrap();
+        assert_eq!(config.maxmemory_policy, "allkeys-random");
+    }
+
+    #[test]
+    fn test_default_maxmemory_policy_is_noeviction() {
+        assert_eq!(ServerConfig::default().maxmemory_policy, "noeviction");
+    }
+
+    #[test]
+    fn test_parse_requirepass() {
+        let config = parse_redis_config("requirepass secret123").unwrap();
+        assert_eq!(config.requirepass, Some("secret123".to_string()));
+    }
+
+    #[test]
+    fn test_default_requirepass_is_none() {
+        assert_eq!(ServerConfig::default().requirepass, None);
+    }
+
+    #[test]
+    fn test_parse_empty_requirepass_disables_auth() {
+        let config = parse_redis_config("requirepass \"\"").unwrap();
+        assert_eq!(config.requirepass, None);
+    }
+
+    #[test]
+    fn test_parse_tls_settings() {
+        let config = parse_redis_config("tls-port 6380\ntls-cert-file /a/cert.pem\ntls-key-file /a/key.pem").unwrap();
+        assert_eq!(config.tls_port, 6380);
+        assert_eq!(config.tls_cert_file, Some("/a/cert.pem".to_string()));
+        assert_eq!(config.tls_key_file, Some("/a/key.pem".to_string()));
     }
 
     #[test]

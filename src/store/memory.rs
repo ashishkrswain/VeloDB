@@ -44,7 +44,95 @@ pub(crate) enum StorageValue {
     NestedHash(HashMap<Vec<u8>, HashMap<Vec<u8>, Vec<u8>>>),
 }
 
+/// A pending (delivered, unacknowledged) stream entry for one consumer
+/// group. Keyed by stream ID within `ConsumerGroup::pending`.
+#[derive(Clone)]
+struct PendingEntry {
+    consumer: String,
+    delivery_time_ms: u64,
+    delivery_count: u64,
+}
+
+/// Redis-style consumer group state: last-delivered cursor, the set of
+/// known consumers, and the pending entries list (PEL) keyed by stream ID.
+struct ConsumerGroup {
+    last_delivered_ms: u64,
+    last_delivered_seq: u64,
+    consumers: HashSet<String>,
+    pending: BTreeMap<(u64, u64), PendingEntry>,
+}
+
+impl ConsumerGroup {
+    fn new(start_ms: u64, start_seq: u64) -> Self {
+        Self { last_delivered_ms: start_ms, last_delivered_seq: start_seq, consumers: HashSet::new(), pending: BTreeMap::new() }
+    }
+}
+
+/// One row of XPENDING's extended (range) reply.
+pub struct PendingDetail {
+    pub id_ms: u64,
+    pub id_seq: u64,
+    pub consumer: String,
+    pub idle_ms: u64,
+    pub delivery_count: u64,
+}
+
+/// Summary form of XPENDING (no range args): count plus the oldest/newest
+/// pending IDs and a per-consumer count, or an empty summary if the PEL
+/// is empty.
+#[derive(Default)]
+pub struct PendingSummary {
+    pub count: usize,
+    pub min_id: Option<(u64, u64)>,
+    pub max_id: Option<(u64, u64)>,
+    pub per_consumer: Vec<(String, usize)>,
+}
+
+/// Where XREADGROUP starts reading from: brand-new entries (the `>` id,
+/// advancing the group's cursor) or replaying a consumer's own PEL from
+/// a given ID (any other id, no cursor movement, no new PEL entries).
+pub enum ReadGroupStart {
+    New,
+    History { after_ms: u64, after_seq: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    NoEviction,
+    AllKeysRandom,
+    VolatileRandom,
+}
+
+impl EvictionPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "noeviction" => Some(Self::NoEviction),
+            "allkeys-random" => Some(Self::AllKeysRandom),
+            "volatile-random" => Some(Self::VolatileRandom),
+            _ => None,
+        }
+    }
+}
+
 impl StorageValue {
+    /// Approximate heap footprint in bytes. Deliberately cheap rather than
+    /// exact — used only for maxmemory accounting.
+    fn estimated_size(&self) -> usize {
+        match self {
+            StorageValue::String(v) => v.len(),
+            StorageValue::List(l) => l.iter().map(|v| v.len() + 24).sum(),
+            StorageValue::Set(s) => s.iter().map(|v| v.len() + 48).sum(),
+            StorageValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 48).sum(),
+            StorageValue::ZSet { members, .. } => members.iter().map(|(m, _)| m.len() * 2 + 64).sum(),
+            StorageValue::Stream { entries, .. } => entries.iter()
+                .map(|e| 16 + e.fields.iter().map(|(k, v)| k.len() + v.len() + 48).sum::<usize>())
+                .sum(),
+            StorageValue::NestedHash(nh) => nh.iter()
+                .map(|(k, inner)| k.len() + 48 + inner.iter().map(|(ik, iv)| ik.len() + iv.len() + 48).sum::<usize>())
+                .sum(),
+        }
+    }
+
     fn type_name(&self) -> &'static str {
         match self {
             StorageValue::String(_) => "string",
@@ -109,7 +197,27 @@ pub struct Store {
     pub block_registry: BlockRegistry,
     pub pubsub_registry: PubSubRegistry,
     pub lua_scripts: dashmap::DashMap<String, String>,
+    /// maxmemory in bytes; 0 = unlimited
+    maxmemory: AtomicU64,
+    eviction_policy: parking_lot::RwLock<EvictionPolicy>,
+    /// Cached estimate updated by refresh_memory_usage(); avoids a full
+    /// scan on every write-path over_memory_limit() check.
+    cached_memory_usage: AtomicU64,
+    /// SCAN cursor registry: token -> last key returned. Bounded; an
+    /// abandoned cursor is eventually evicted and scans restarted with
+    /// it terminate (cursor 0, empty page).
+    scan_cursors: DashMap<u64, Vec<u8>>,
+    next_scan_cursor: AtomicU64,
+    /// Consumer groups keyed by (db_idx, stream_key, group_name). Kept
+    /// out-of-band from StorageValue::Stream (like BlockRegistry and
+    /// PubSubRegistry) so RDB/AOF-rewrite serialization of streams is
+    /// unaffected; group state is process-local, matching how Redis
+    /// itself does not require consumer group config to be identical
+    /// across replicas beyond the stream data itself.
+    consumer_groups: DashMap<(usize, Vec<u8>, String), ConsumerGroup>,
 }
+
+const MAX_SCAN_CURSORS: usize = 1024;
 
 pub struct PubSubRegistry {
     channels: dashmap::DashMap<Vec<u8>, Vec<tokio::sync::mpsc::UnboundedSender<(Vec<u8>, Vec<u8>)>>>,
@@ -181,7 +289,177 @@ impl PubSubRegistry {
 
 impl Store {
     pub fn new(num: usize) -> Self {
-        Self { databases: (0..num).map(|_| DashMap::new()).collect(), block_registry: BlockRegistry::new(), pubsub_registry: PubSubRegistry::new(), lua_scripts: dashmap::DashMap::new() }
+        Self {
+            databases: (0..num).map(|_| DashMap::new()).collect(),
+            block_registry: BlockRegistry::new(),
+            pubsub_registry: PubSubRegistry::new(),
+            lua_scripts: dashmap::DashMap::new(),
+            maxmemory: AtomicU64::new(0),
+            eviction_policy: parking_lot::RwLock::new(EvictionPolicy::NoEviction),
+            cached_memory_usage: AtomicU64::new(0),
+            scan_cursors: DashMap::new(),
+            next_scan_cursor: AtomicU64::new(1),
+            consumer_groups: DashMap::new(),
+        }
+    }
+
+    // ========= SCAN =========
+
+    /// Cursor-based key iteration. Traverses keys in sorted order; the
+    /// cursor token maps to the last key returned, so every key present
+    /// for the whole scan is returned exactly once even if other keys
+    /// are added or removed mid-scan. Returns (next_cursor, keys);
+    /// next_cursor == 0 means the scan is complete.
+    pub fn scan_keys(&self, db_idx: usize, cursor: u64, pattern: Option<&str>, count: usize) -> Result<(u64, Vec<Vec<u8>>)> {
+        let db = self.db(db_idx)?;
+        let start_after: Option<Vec<u8>> = if cursor == 0 {
+            None
+        } else {
+            match self.scan_cursors.remove(&cursor) {
+                Some((_, key)) => Some(key),
+                None => return Ok((0, vec![])), // stale/unknown cursor: terminate scan
+            }
+        };
+
+        let count = count.max(1);
+        let mut keys: Vec<Vec<u8>> = db.iter()
+            .filter(|e| start_after.as_ref().map_or(true, |s| e.key() > s))
+            .map(|e| e.key().clone())
+            .collect();
+        keys.sort();
+        let has_more = keys.len() > count;
+        keys.truncate(count);
+
+        let next_cursor = if has_more {
+            let last = keys.last().cloned().unwrap_or_default();
+            if self.scan_cursors.len() >= MAX_SCAN_CURSORS {
+                self.scan_cursors.clear(); // crude bound; abandoned scans restart from 0
+            }
+            let token = self.next_scan_cursor.fetch_add(1, Ordering::Relaxed);
+            self.scan_cursors.insert(token, last);
+            token
+        } else { 0 };
+
+        // MATCH and expiry filtering happen after pagination, like Redis:
+        // a page may return fewer than `count` keys (even zero) while the
+        // cursor is still nonzero.
+        let result: Vec<Vec<u8>> = keys.into_iter()
+            .filter(|k| db.get(k).map_or(false, |e| !Self::expired(&e)))
+            .filter(|k| pattern.map_or(true, |p| simple_match(&String::from_utf8_lossy(k), p)))
+            .collect();
+        Ok((next_cursor, result))
+    }
+
+    /// HSCAN: returns all field/value pairs in one page (cursor 0), the
+    /// same behavior Redis has for small hashes.
+    pub fn hscan(&self, db_idx: usize, key: &[u8]) -> Result<(u64, Vec<(Vec<u8>, Vec<u8>)>)> {
+        match self.entry(db_idx, key)? {
+            Some(e) => match &e.value {
+                StorageValue::Hash(h) => Ok((0, h.iter().map(|(k, v)| (k.clone(), v.clone())).collect())),
+                _ => Err(VeloDBError::wrong_type()),
+            },
+            None => Ok((0, vec![])),
+        }
+    }
+
+    /// SSCAN: returns all members in one page (cursor 0).
+    pub fn sscan(&self, db_idx: usize, key: &[u8]) -> Result<(u64, Vec<Vec<u8>>)> {
+        match self.entry(db_idx, key)? {
+            Some(e) => match &e.value {
+                StorageValue::Set(s) => Ok((0, s.iter().cloned().collect())),
+                _ => Err(VeloDBError::wrong_type()),
+            },
+            None => Ok((0, vec![])),
+        }
+    }
+
+    /// ZSCAN: returns all (member, score) pairs in one page (cursor 0).
+    pub fn zscan(&self, db_idx: usize, key: &[u8]) -> Result<(u64, Vec<(Vec<u8>, f64)>)> {
+        match self.entry(db_idx, key)? {
+            Some(e) => match &e.value {
+                StorageValue::ZSet { members, .. } => Ok((0, members.iter().map(|(m, s)| (m.clone(), *s)).collect())),
+                _ => Err(VeloDBError::wrong_type()),
+            },
+            None => Ok((0, vec![])),
+        }
+    }
+
+    // ========= maxmemory / eviction =========
+
+    pub fn configure_memory(&self, maxmemory: u64, policy: EvictionPolicy) {
+        self.maxmemory.store(maxmemory, Ordering::Relaxed);
+        *self.eviction_policy.write() = policy;
+    }
+
+    pub fn eviction_policy(&self) -> EvictionPolicy {
+        *self.eviction_policy.read()
+    }
+
+    pub fn maxmemory(&self) -> u64 {
+        self.maxmemory.load(Ordering::Relaxed)
+    }
+
+    /// Full-scan estimate of dataset memory (keys + values + fixed
+    /// per-entry overhead). O(n) — call from the background cycle,
+    /// not per command.
+    pub fn estimated_memory(&self) -> u64 {
+        let mut total = 0u64;
+        for db in &self.databases {
+            for e in db.iter() {
+                total += (e.key().len() + e.value.estimated_size() + 64) as u64;
+            }
+        }
+        total
+    }
+
+    pub fn refresh_memory_usage(&self) -> u64 {
+        let usage = self.estimated_memory();
+        self.cached_memory_usage.store(usage, Ordering::Relaxed);
+        usage
+    }
+
+    /// Cheap check against the cached usage estimate. Refreshed by the
+    /// background memory cycle, so it can lag by one interval.
+    pub fn over_memory_limit(&self) -> bool {
+        let limit = self.maxmemory.load(Ordering::Relaxed);
+        limit != 0 && self.cached_memory_usage.load(Ordering::Relaxed) > limit
+    }
+
+    /// Evicts keys according to `policy` until estimated memory is at or
+    /// under `target_bytes` or no more candidates exist. Returns the
+    /// number of keys evicted.
+    pub fn evict_until_under(&self, target_bytes: u64, policy: EvictionPolicy) -> usize {
+        if policy == EvictionPolicy::NoEviction {
+            return 0;
+        }
+        let mut evicted = 0;
+        let mut usage = self.estimated_memory();
+        while usage > target_bytes {
+            let mut progressed = false;
+            for db in &self.databases {
+                if usage <= target_bytes { break; }
+                let candidate = db.iter()
+                    .filter(|e| match policy {
+                        EvictionPolicy::VolatileRandom => e.expire_at.is_some(),
+                        _ => true,
+                    })
+                    .map(|e| (e.key().clone(), (e.key().len() + e.value.estimated_size() + 64) as u64))
+                    .next();
+                if let Some((key, size)) = candidate {
+                    if db.remove(&key).is_some() {
+                        usage = usage.saturating_sub(size);
+                        evicted += 1;
+                        progressed = true;
+                        tracing::debug!("Evicted key ({} bytes) under {:?} policy", size, policy);
+                    }
+                }
+            }
+            if !progressed {
+                break; // no candidates left (e.g. volatile policy, no TTL'd keys)
+            }
+        }
+        self.cached_memory_usage.store(usage, Ordering::Relaxed);
+        evicted
     }
 
     fn db(&self, idx: usize) -> Result<&DashMap<Vec<u8>, Entry>> {
@@ -283,6 +561,13 @@ impl Store {
         Ok(count)
     }
 
+    /// Number of live (non-expired) keys with a TTL set, for INFO's
+    /// keyspace section (`dbN:keys=X,expires=Y`).
+    pub fn expires_count(&self, db_idx: usize) -> Result<usize> {
+        let db = self.db(db_idx)?;
+        Ok(db.iter().filter(|e| !Self::expired(e) && e.expire_at.is_some()).count())
+    }
+
     pub fn flushdb(&self, db_idx: usize) -> Result<()> { self.db(db_idx)?.clear(); Ok(()) }
     pub fn flushall(&self) -> Result<()> { for db in &self.databases { db.clear(); } Ok(()) }
 
@@ -292,6 +577,36 @@ impl Store {
         if keys.is_empty() { return Ok(None); }
         let idx = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().subsec_nanos() as usize % keys.len();
         Ok(Some(keys[idx].clone()))
+    }
+
+    /// Active expiry cycle (Redis serverCron style). Samples up to
+    /// `sample_size` volatile keys per database and removes expired ones,
+    /// repeating while more than 25% of the sample was expired.
+    /// Returns the total number of keys removed.
+    pub fn active_expire_cycle(&self, sample_size: usize) -> usize {
+        let sample_size = sample_size.max(1);
+        let mut total_removed = 0;
+        for db in &self.databases {
+            loop {
+                // Collect first, then remove: removing while holding
+                // DashMap iter refs can deadlock on the same shard.
+                let expired_keys: Vec<Vec<u8>> = db.iter()
+                    .filter(|e| e.expire_at.is_some())
+                    .take(sample_size)
+                    .filter(|e| Self::expired(e))
+                    .map(|e| e.key().clone())
+                    .collect();
+                let removed = expired_keys.len();
+                for key in expired_keys {
+                    db.remove(&key);
+                }
+                total_removed += removed;
+                if removed * 4 <= sample_size {
+                    break;
+                }
+            }
+        }
+        total_removed
     }
 
     pub fn iterate_db(&self, db_idx: usize) -> Result<Vec<(Vec<u8>, Entry)>> {
@@ -1069,6 +1384,182 @@ impl Store {
         Ok(result)
     }
 
+    // ========= Stream consumer groups =========
+
+    fn cg_key(db_idx: usize, key: &[u8], group: &str) -> (usize, Vec<u8>, String) {
+        (db_idx, key.to_vec(), group.to_string())
+    }
+
+    pub fn xgroup_create(&self, db_idx: usize, key: &[u8], group: &str, start_id: &[u8], mkstream: bool) -> Result<()> {
+        let exists = self.exists(db_idx, key)?;
+        if !exists {
+            if !mkstream { return Err(VeloDBError::internal("ERR The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.")); }
+            self.db(db_idx)?.insert(key.to_vec(), Entry { value: StorageValue::Stream { entries: VecDeque::new(), last_id_ms: 0, last_id_seq: 0 }, expire_at: None, version: 0 });
+        } else if !matches!(self.entry(db_idx, key)?.map(|e| e.value.type_name()), Some("stream")) {
+            return Err(VeloDBError::wrong_type());
+        }
+        let (start_ms, start_seq) = if start_id == b"$" {
+            self.get_stream_last_id(db_idx, key)
+        } else {
+            self.parse_stream_id(start_id, true)
+        };
+        self.consumer_groups.insert(Self::cg_key(db_idx, key, group), ConsumerGroup::new(start_ms, start_seq));
+        Ok(())
+    }
+
+    pub fn xgroup_destroy(&self, db_idx: usize, key: &[u8], group: &str) -> Result<bool> {
+        Ok(self.consumer_groups.remove(&Self::cg_key(db_idx, key, group)).is_some())
+    }
+
+    /// Returns true if the consumer was newly created, false if it already existed.
+    pub fn xgroup_create_consumer(&self, db_idx: usize, key: &[u8], group: &str, consumer: &str) -> Result<bool> {
+        match self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group)) {
+            Some(mut cg) => Ok(cg.consumers.insert(consumer.to_string())),
+            None => Err(VeloDBError::internal("NOGROUP No such consumer group")),
+        }
+    }
+
+    /// Removes the consumer and returns the number of pending entries it held.
+    pub fn xgroup_del_consumer(&self, db_idx: usize, key: &[u8], group: &str, consumer: &str) -> Result<usize> {
+        match self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group)) {
+            Some(mut cg) => {
+                cg.consumers.remove(consumer);
+                let count = cg.pending.iter().filter(|(_, p)| p.consumer == consumer).count();
+                cg.pending.retain(|_, p| p.consumer != consumer);
+                Ok(count)
+            }
+            None => Err(VeloDBError::internal("NOGROUP No such consumer group")),
+        }
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+    }
+
+    /// XREADGROUP: delivers either brand-new entries (advancing the
+    /// group's cursor and, unless `noack`, adding them to the PEL under
+    /// `consumer`) or replays `consumer`'s own history from an explicit ID.
+    pub fn xreadgroup(&self, db_idx: usize, key: &[u8], group: &str, consumer: &str, start: ReadGroupStart, count: Option<usize>, noack: bool) -> Result<Vec<StreamEntry>> {
+        if !matches!(self.entry(db_idx, key)?.map(|e| e.value.type_name()), Some("stream")) && self.exists(db_idx, key)? {
+            return Err(VeloDBError::wrong_type());
+        }
+        let mut cg = self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group))
+            .ok_or_else(|| VeloDBError::internal("NOGROUP No such consumer group"))?;
+        cg.consumers.insert(consumer.to_string());
+
+        match start {
+            ReadGroupStart::New => {
+                let after = (cg.last_delivered_ms, cg.last_delivered_seq);
+                drop(cg);
+                let entries = self.stream_entries_after(db_idx, key, after.0, after.1, count)?;
+                if !entries.is_empty() {
+                    let mut cg = self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group)).unwrap();
+                    let last = entries.last().unwrap();
+                    cg.last_delivered_ms = last.id_ms;
+                    cg.last_delivered_seq = last.id_seq;
+                    if !noack {
+                        let now = Self::now_ms();
+                        for e in &entries {
+                            cg.pending.insert((e.id_ms, e.id_seq), PendingEntry {
+                                consumer: consumer.to_string(), delivery_time_ms: now, delivery_count: 1,
+                            });
+                        }
+                    }
+                }
+                Ok(entries)
+            }
+            ReadGroupStart::History { after_ms, after_seq } => {
+                let ids: Vec<(u64, u64)> = cg.pending.iter()
+                    .filter(|(id, p)| p.consumer == consumer && (id.0 > after_ms || (id.0 == after_ms && id.1 > after_seq)))
+                    .map(|(id, _)| *id)
+                    .take(count.unwrap_or(usize::MAX))
+                    .collect();
+                drop(cg);
+                let all = self.stream_entries(db_idx, key)?;
+                Ok(all.into_iter().filter(|e| ids.contains(&(e.id_ms, e.id_seq))).collect())
+            }
+        }
+    }
+
+    /// Acknowledges delivered entries, removing them from the PEL. Returns the count acked.
+    pub fn xack(&self, db_idx: usize, key: &[u8], group: &str, ids: &[(u64, u64)]) -> Result<usize> {
+        match self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group)) {
+            Some(mut cg) => {
+                let mut acked = 0;
+                for id in ids {
+                    if cg.pending.remove(id).is_some() { acked += 1; }
+                }
+                Ok(acked)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// XPENDING with no range args: count, min/max IDs, and a per-consumer breakdown.
+    pub fn xpending_summary(&self, db_idx: usize, key: &[u8], group: &str) -> Result<PendingSummary> {
+        match self.consumer_groups.get(&Self::cg_key(db_idx, key, group)) {
+            Some(cg) => {
+                if cg.pending.is_empty() { return Ok(PendingSummary::default()); }
+                let mut per_consumer: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for p in cg.pending.values() { *per_consumer.entry(p.consumer.clone()).or_default() += 1; }
+                Ok(PendingSummary {
+                    count: cg.pending.len(),
+                    min_id: cg.pending.keys().next().copied(),
+                    max_id: cg.pending.keys().last().copied(),
+                    per_consumer: per_consumer.into_iter().collect(),
+                })
+            }
+            None => Err(VeloDBError::internal("NOGROUP No such consumer group")),
+        }
+    }
+
+    /// XPENDING with range args (start/end/count, optional consumer filter).
+    pub fn xpending_range(&self, db_idx: usize, key: &[u8], group: &str, start: (u64, u64), end: (u64, u64), count: usize, consumer_filter: Option<&str>) -> Result<Vec<PendingDetail>> {
+        match self.consumer_groups.get(&Self::cg_key(db_idx, key, group)) {
+            Some(cg) => {
+                let now = Self::now_ms();
+                Ok(cg.pending.iter()
+                    .filter(|(id, _)| **id >= start && **id <= end)
+                    .filter(|(_, p)| consumer_filter.map_or(true, |c| p.consumer == c))
+                    .take(count)
+                    .map(|(id, p)| PendingDetail {
+                        id_ms: id.0, id_seq: id.1, consumer: p.consumer.clone(),
+                        idle_ms: now.saturating_sub(p.delivery_time_ms), delivery_count: p.delivery_count,
+                    })
+                    .collect())
+            }
+            None => Err(VeloDBError::internal("NOGROUP No such consumer group")),
+        }
+    }
+
+    /// XCLAIM: transfers ownership of pending entries idle for at least
+    /// `min_idle_ms` to `consumer`. Skips entries that are not idle
+    /// enough unless `force`. Returns the claimed entries (empty if
+    /// `justid` — caller distinguishes by not needing entry bodies).
+    pub fn xclaim(&self, db_idx: usize, key: &[u8], group: &str, consumer: &str, min_idle_ms: u64, ids: &[(u64, u64)], _force: bool, justid: bool) -> Result<Vec<StreamEntry>> {
+        let now = Self::now_ms();
+        let claimed_ids: Vec<(u64, u64)> = {
+            let mut cg = self.consumer_groups.get_mut(&Self::cg_key(db_idx, key, group))
+                .ok_or_else(|| VeloDBError::internal("NOGROUP No such consumer group"))?;
+            cg.consumers.insert(consumer.to_string());
+            let mut claimed = Vec::new();
+            for id in ids {
+                if let Some(p) = cg.pending.get_mut(id) {
+                    if now.saturating_sub(p.delivery_time_ms) >= min_idle_ms {
+                        p.consumer = consumer.to_string();
+                        p.delivery_time_ms = now;
+                        p.delivery_count += 1;
+                        claimed.push(*id);
+                    }
+                }
+            }
+            claimed
+        };
+        if justid || claimed_ids.is_empty() { return Ok(claimed_ids.into_iter().map(|(id_ms, id_seq)| StreamEntry { id_ms, id_seq, fields: vec![] }).collect()); }
+        let all = self.stream_entries(db_idx, key)?;
+        Ok(all.into_iter().filter(|e| claimed_ids.contains(&(e.id_ms, e.id_seq))).collect())
+    }
+
     // ========= NestedHash methods =========
 
     pub fn nhset(&self, db_idx: usize, key: &[u8], field: &[u8], subfield: &[u8], value: &[u8]) -> Result<usize> {
@@ -1177,7 +1668,7 @@ impl Store {
     }
 }
 
-fn simple_match(s: &str, p: &str) -> bool {
+pub fn simple_match(s: &str, p: &str) -> bool {
     let s = s.as_bytes();
     let p = p.as_bytes();
     let (mut si, mut pi) = (0, 0);
@@ -1822,6 +2313,424 @@ mod tests {
         s.set(0, b"b", b"v", None).unwrap();
         s.set_expire(0, b"b", 0).unwrap();
         assert_eq!(s.dbsize(0).unwrap(), 1);
+    }
+
+    // ========= Stream consumer groups =========
+    #[test]
+    fn test_xgroup_create_and_destroy() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        assert!(s.xgroup_destroy(0, b"stream", "g1").unwrap());
+        assert!(!s.xgroup_destroy(0, b"stream", "g1").unwrap(), "destroying twice returns false");
+    }
+
+    #[test]
+    fn test_xgroup_create_requires_existing_stream_unless_mkstream() {
+        let s = make_store();
+        assert!(s.xgroup_create(0, b"nostream", "g1", b"0", false).is_err());
+        assert!(s.xgroup_create(0, b"nostream", "g1", b"0", true).is_ok(), "MKSTREAM must create the stream");
+        assert_eq!(s.xlen(0, b"nostream").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_xgroup_create_consumer_and_del_consumer() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"v".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        assert!(s.xgroup_create_consumer(0, b"stream", "g1", "c1").unwrap());
+        assert!(!s.xgroup_create_consumer(0, b"stream", "g1", "c1").unwrap(), "second create returns false, already exists");
+        assert_eq!(s.xgroup_del_consumer(0, b"stream", "g1", "c1").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_xreadgroup_delivers_new_entries_and_creates_pel() {
+        let s = make_store();
+        let id1 = s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+
+        let entries = s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(format!("{}-{}", entries[0].id_ms, entries[0].id_seq).into_bytes(), id1);
+
+        let summary = s.xpending_summary(0, b"stream", "g1").unwrap();
+        assert_eq!(summary.count, 1, "delivered entry must land in the PEL");
+    }
+
+    #[test]
+    fn test_xreadgroup_new_only_returns_undelivered() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+
+        // No new entries since; a second ">" read must return nothing.
+        let entries = s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+        assert_eq!(entries.len(), 0);
+    }
+
+    #[test]
+    fn test_xreadgroup_noack_skips_pel() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, true).unwrap();
+
+        let summary = s.xpending_summary(0, b"stream", "g1").unwrap();
+        assert_eq!(summary.count, 0, "NOACK must not create a pending entry");
+    }
+
+    #[test]
+    fn test_xack_removes_from_pel() {
+        let s = make_store();
+        let id1 = s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+
+        let (ms, seq) = parse_id_for_test(&id1);
+        let acked = s.xack(0, b"stream", "g1", &[(ms, seq)]).unwrap();
+        assert_eq!(acked, 1);
+        assert_eq!(s.xpending_summary(0, b"stream", "g1").unwrap().count, 0);
+    }
+
+    #[test]
+    fn test_xack_unknown_id_returns_zero() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        assert_eq!(s.xack(0, b"stream", "g1", &[(999, 0)]).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_xpending_range_returns_details() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+
+        let details = s.xpending_range(0, b"stream", "g1", (0, 0), (u64::MAX, u64::MAX), 10, None).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].consumer, "c1");
+        assert_eq!(details[0].delivery_count, 1);
+    }
+
+    #[test]
+    fn test_xpending_range_filters_by_consumer() {
+        let s = make_store();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"2".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, Some(1), false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c2", ReadGroupStart::New, Some(1), false).unwrap();
+
+        let details = s.xpending_range(0, b"stream", "g1", (0, 0), (u64::MAX, u64::MAX), 10, Some("c2")).unwrap();
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0].consumer, "c2");
+    }
+
+    #[test]
+    fn test_xclaim_transfers_ownership() {
+        let s = make_store();
+        let id1 = s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+
+        let (ms, seq) = parse_id_for_test(&id1);
+        // min_idle_time 0 so claim always succeeds regardless of actual idle time
+        let claimed = s.xclaim(0, b"stream", "g1", "c2", 0, &[(ms, seq)], false, false).unwrap();
+        assert_eq!(claimed.len(), 1);
+
+        let details = s.xpending_range(0, b"stream", "g1", (0, 0), (u64::MAX, u64::MAX), 10, None).unwrap();
+        assert_eq!(details[0].consumer, "c2", "ownership must transfer to the claiming consumer");
+        assert_eq!(details[0].delivery_count, 2, "claim increments delivery count");
+    }
+
+    #[test]
+    fn test_xclaim_respects_min_idle_time() {
+        let s = make_store();
+        let id1 = s.xadd(0, b"stream", b"*", &[(b"f".to_vec(), b"1".to_vec())], None).unwrap();
+        s.xgroup_create(0, b"stream", "g1", b"0", false).unwrap();
+        s.xreadgroup(0, b"stream", "g1", "c1", ReadGroupStart::New, None, false).unwrap();
+
+        let (ms, seq) = parse_id_for_test(&id1);
+        // Entry was just delivered, so idle time is ~0ms; a huge min_idle_time must reject the claim.
+        let claimed = s.xclaim(0, b"stream", "g1", "c2", 10_000_000, &[(ms, seq)], false, false).unwrap();
+        assert_eq!(claimed.len(), 0);
+    }
+
+    #[test]
+    fn test_xreadgroup_wrongtype() {
+        let s = make_store();
+        s.set(0, b"str", b"v", None).unwrap();
+        assert!(s.xgroup_create(0, b"str", "g1", b"0", false).is_err());
+    }
+
+    fn parse_id_for_test(id: &[u8]) -> (u64, u64) {
+        let s = String::from_utf8_lossy(id);
+        let parts: Vec<&str> = s.splitn(2, '-').collect();
+        (parts[0].parse().unwrap(), parts[1].parse().unwrap())
+    }
+
+    // ========= expires_count (for INFO keyspace) =========
+    #[test]
+    fn test_expires_count_reflects_keys_with_ttl() {
+        let s = make_store();
+        s.set(0, b"no_ttl", b"v", None).unwrap();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        s.set(0, b"has_ttl", b"v", Some(now + 5_000_000)).unwrap();
+        assert_eq!(s.expires_count(0).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_expires_count_excludes_already_expired() {
+        let s = make_store();
+        s.set(0, b"dead", b"v", Some(1)).unwrap();
+        assert_eq!(s.expires_count(0).unwrap(), 0);
+    }
+
+    // ========= SCAN =========
+    #[test]
+    fn test_scan_full_traversal_across_pages() {
+        let s = make_store();
+        for i in 0..25u32 {
+            s.set(0, format!("k{:02}", i).as_bytes(), b"v", None).unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = 0u64;
+        let mut pages = 0;
+        loop {
+            let (next, keys) = s.scan_keys(0, cursor, None, 10).unwrap();
+            for k in keys {
+                assert!(seen.insert(k), "duplicate key returned by scan");
+            }
+            pages += 1;
+            if next == 0 { break; }
+            cursor = next;
+        }
+        assert_eq!(seen.len(), 25);
+        assert!(pages >= 3, "expected multiple pages with count=10");
+    }
+
+    #[test]
+    fn test_scan_single_page_when_count_covers_all() {
+        let s = make_store();
+        s.set(0, b"a", b"v", None).unwrap();
+        s.set(0, b"b", b"v", None).unwrap();
+        let (next, keys) = s.scan_keys(0, 0, None, 100).unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_match_pattern() {
+        let s = make_store();
+        s.set(0, b"user:1", b"v", None).unwrap();
+        s.set(0, b"user:2", b"v", None).unwrap();
+        s.set(0, b"order:1", b"v", None).unwrap();
+        let (next, keys) = s.scan_keys(0, 0, Some("user:*"), 100).unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(keys.len(), 2);
+    }
+
+    #[test]
+    fn test_scan_survives_deletion_mid_scan() {
+        let s = make_store();
+        for i in 0..20u32 {
+            s.set(0, format!("k{:02}", i).as_bytes(), b"v", None).unwrap();
+        }
+        let (cursor, first_page) = s.scan_keys(0, 0, None, 5).unwrap();
+        assert!(cursor != 0);
+        // Delete a key from the first page (already returned) and continue
+        s.del(0, &first_page[0]).unwrap();
+        let mut seen: std::collections::HashSet<Vec<u8>> = first_page.iter().cloned().collect();
+        let mut c = cursor;
+        loop {
+            let (next, keys) = s.scan_keys(0, c, None, 5).unwrap();
+            for k in keys { assert!(seen.insert(k), "duplicate during scan"); }
+            if next == 0 { break; }
+            c = next;
+        }
+        assert_eq!(seen.len(), 20, "all keys present at scan start must be seen");
+    }
+
+    #[test]
+    fn test_scan_skips_expired() {
+        let s = make_store();
+        s.set(0, b"live", b"v", None).unwrap();
+        s.set(0, b"dead", b"v", Some(1)).unwrap();
+        let (_, keys) = s.scan_keys(0, 0, None, 100).unwrap();
+        assert_eq!(keys, vec![b"live".to_vec()]);
+    }
+
+    #[test]
+    fn test_hscan_returns_all_pairs() {
+        let s = make_store();
+        s.hset(0, b"h", &[(b"f1".to_vec(), b"v1".to_vec()), (b"f2".to_vec(), b"v2".to_vec())]).unwrap();
+        let (next, pairs) = s.hscan(0, b"h").unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn test_sscan_returns_all_members() {
+        let s = make_store();
+        s.sadd(0, b"s", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
+        let (next, members) = s.sscan(0, b"s").unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(members.len(), 2);
+    }
+
+    #[test]
+    fn test_zscan_returns_members_with_scores() {
+        let s = make_store();
+        s.zadd(0, b"z", &[(1.0, b"a".to_vec()), (2.0, b"b".to_vec())]).unwrap();
+        let (next, pairs) = s.zscan(0, b"z").unwrap();
+        assert_eq!(next, 0);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|(m, score)| m == b"a" && *score == 1.0));
+    }
+
+    #[test]
+    fn test_scan_container_missing_key_returns_empty() {
+        let s = make_store();
+        assert_eq!(s.hscan(0, b"nope").unwrap(), (0, vec![]));
+        assert_eq!(s.sscan(0, b"nope").unwrap(), (0, vec![]));
+        assert_eq!(s.zscan(0, b"nope").unwrap(), (0, vec![]));
+    }
+
+    #[test]
+    fn test_scan_container_wrongtype() {
+        let s = make_store();
+        s.set(0, b"str", b"v", None).unwrap();
+        assert!(s.hscan(0, b"str").is_err());
+        assert!(s.sscan(0, b"str").is_err());
+        assert!(s.zscan(0, b"str").is_err());
+    }
+
+    // ========= maxmemory / eviction =========
+    #[test]
+    fn test_estimated_memory_grows_with_data() {
+        let s = make_store();
+        let empty = s.estimated_memory();
+        s.set(0, b"key1", &[0u8; 1000], None).unwrap();
+        let after = s.estimated_memory();
+        assert!(after >= empty + 1000, "expected at least 1000 bytes growth, got {} -> {}", empty, after);
+    }
+
+    #[test]
+    fn test_evict_allkeys_random_until_under_limit() {
+        let s = make_store();
+        for i in 0..50u32 {
+            s.set(0, format!("k{}", i).as_bytes(), &[0u8; 100], None).unwrap();
+        }
+        let used = s.estimated_memory();
+        let target = used / 2;
+        let evicted = s.evict_until_under(target, EvictionPolicy::AllKeysRandom);
+        assert!(evicted > 0);
+        assert!(s.estimated_memory() <= target);
+    }
+
+    #[test]
+    fn test_evict_volatile_random_only_evicts_keys_with_ttl() {
+        let s = make_store();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        for i in 0..10u32 {
+            s.set(0, format!("keep{}", i).as_bytes(), &[0u8; 100], None).unwrap();
+        }
+        for i in 0..10u32 {
+            s.set(0, format!("vol{}", i).as_bytes(), &[0u8; 100], Some(now + 5_000_000)).unwrap();
+        }
+        // Target of 0 is unreachable: volatile policy must stop after
+        // evicting all TTL'd keys rather than touch persistent ones.
+        let evicted = s.evict_until_under(0, EvictionPolicy::VolatileRandom);
+        assert_eq!(evicted, 10);
+        assert_eq!(s.databases[0].len(), 10);
+        for i in 0..10u32 {
+            assert!(s.exists(0, format!("keep{}", i).as_bytes()).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_evict_noeviction_never_evicts() {
+        let s = make_store();
+        s.set(0, b"k", &[0u8; 100], None).unwrap();
+        let evicted = s.evict_until_under(0, EvictionPolicy::NoEviction);
+        assert_eq!(evicted, 0);
+        assert_eq!(s.databases[0].len(), 1);
+    }
+
+    #[test]
+    fn test_eviction_policy_from_str() {
+        assert_eq!(EvictionPolicy::parse("noeviction"), Some(EvictionPolicy::NoEviction));
+        assert_eq!(EvictionPolicy::parse("allkeys-random"), Some(EvictionPolicy::AllKeysRandom));
+        assert_eq!(EvictionPolicy::parse("volatile-random"), Some(EvictionPolicy::VolatileRandom));
+        assert_eq!(EvictionPolicy::parse("bogus"), None);
+    }
+
+    #[test]
+    fn test_over_memory_limit_reflects_refreshed_usage() {
+        let s = make_store();
+        s.configure_memory(1, EvictionPolicy::NoEviction); // 1 byte limit
+        assert!(!s.over_memory_limit(), "not over limit before usage refresh");
+        s.set(0, b"k", &[0u8; 1000], None).unwrap();
+        s.refresh_memory_usage();
+        assert!(s.over_memory_limit());
+    }
+
+    #[test]
+    fn test_no_limit_means_never_over() {
+        let s = make_store();
+        s.set(0, b"k", &[0u8; 1000], None).unwrap();
+        s.refresh_memory_usage();
+        assert!(!s.over_memory_limit(), "maxmemory=0 means unlimited");
+    }
+
+    #[test]
+    fn test_active_expire_removes_expired_keys() {
+        let s = make_store();
+        s.set(0, b"live", b"v", None).unwrap();
+        s.set(0, b"dead1", b"v", Some(1)).unwrap();
+        s.set(0, b"dead2", b"v", Some(1)).unwrap();
+        // Expired entries are physically present until removed
+        assert_eq!(s.databases[0].len(), 3);
+        let removed = s.active_expire_cycle(20);
+        assert_eq!(removed, 2);
+        assert_eq!(s.databases[0].len(), 1);
+        assert_eq!(s.get(0, b"live").unwrap().unwrap(), b"v");
+    }
+
+    #[test]
+    fn test_active_expire_keeps_future_ttls() {
+        let s = make_store();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+        s.set(0, b"future", b"v", Some(now + 5_000_000)).unwrap();
+        s.set(0, b"no_ttl", b"v", None).unwrap();
+        let removed = s.active_expire_cycle(20);
+        assert_eq!(removed, 0);
+        assert_eq!(s.databases[0].len(), 2);
+    }
+
+    #[test]
+    fn test_active_expire_all_databases() {
+        let s = Store::new(2);
+        s.set(0, b"dead", b"v", Some(1)).unwrap();
+        s.set(1, b"dead", b"v", Some(1)).unwrap();
+        let removed = s.active_expire_cycle(20);
+        assert_eq!(removed, 2);
+        assert_eq!(s.databases[0].len(), 0);
+        assert_eq!(s.databases[1].len(), 0);
+    }
+
+    #[test]
+    fn test_active_expire_drains_beyond_sample_size() {
+        let s = make_store();
+        for i in 0..100u32 {
+            s.set(0, format!("dead{}", i).as_bytes(), b"v", Some(1)).unwrap();
+        }
+        // Redis-style: keeps sampling while >25% of samples are expired
+        let removed = s.active_expire_cycle(20);
+        assert_eq!(removed, 100);
+        assert_eq!(s.databases[0].len(), 0);
     }
 
     #[test]

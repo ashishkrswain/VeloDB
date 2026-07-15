@@ -36,8 +36,9 @@ impl ServerHandle {
             let config = self.config.clone();
             let aof_writer = self.aof_writer.clone();
             let repl_backlog = self.repl_backlog.clone();
+            let replid = self.replid.clone();
             tokio::spawn(async move {
-                if let Err(e) = connection::handle(socket, store, cmd_table, config, aof_writer, repl_backlog).await {
+                if let Err(e) = connection::handle(socket, store, cmd_table, config, aof_writer, repl_backlog, replid).await {
                     tracing::warn!("Connection error from {}: {}", addr, e);
                 }
                 tracing::debug!("Connection from {} closed", addr);

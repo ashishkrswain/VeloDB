@@ -25,7 +25,105 @@ pub const COMMANDS: &[CommandDef] = &[
     CommandDef { name: "FLUSHDB", arity: 1, handler: flushdb_cmd },
     CommandDef { name: "FLUSHALL", arity: 1, handler: flushall_cmd },
     CommandDef { name: "RANDOMKEY", arity: 1, handler: randomkey_cmd },
+    CommandDef { name: "SCAN", arity: -2, handler: scan_cmd },
+    CommandDef { name: "HSCAN", arity: -3, handler: hscan_cmd },
+    CommandDef { name: "SSCAN", arity: -3, handler: sscan_cmd },
+    CommandDef { name: "ZSCAN", arity: -3, handler: zscan_cmd },
 ];
+
+fn parse_cursor(raw: &[u8]) -> crate::error::Result<u64> {
+    String::from_utf8_lossy(raw).parse()
+        .map_err(|_| crate::error::VeloDBError::internal("ERR invalid cursor"))
+}
+
+/// Parses trailing `[MATCH pattern] [COUNT n]` options of SCAN commands.
+fn parse_scan_opts(args: &[Vec<u8>]) -> crate::error::Result<(Option<String>, usize)> {
+    let mut pattern = None;
+    let mut count = 10usize;
+    let mut i = 0;
+    while i < args.len() {
+        let opt = String::from_utf8_lossy(&args[i]).to_uppercase();
+        match opt.as_str() {
+            "MATCH" if i + 1 < args.len() => {
+                pattern = Some(String::from_utf8_lossy(&args[i + 1]).to_string());
+                i += 2;
+            }
+            "COUNT" if i + 1 < args.len() => {
+                count = String::from_utf8_lossy(&args[i + 1]).parse()
+                    .map_err(|_| crate::error::VeloDBError::not_integer())?;
+                if count == 0 { return Err(crate::error::VeloDBError::syntax_error()); }
+                i += 2;
+            }
+            _ => return Err(crate::error::VeloDBError::syntax_error()),
+        }
+    }
+    Ok((pattern, count))
+}
+
+fn scan_reply(cursor: u64, items: Vec<RespValue>) -> RespValue {
+    RespValue::Array(Some(vec![
+        RespValue::bulk_string(cursor.to_string().into_bytes()),
+        RespValue::Array(Some(items)),
+    ]))
+}
+
+fn scan_cmd(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error::Result<RespValue> {
+    let cursor = parse_cursor(&args[0])?;
+    let (pattern, count) = parse_scan_opts(&args[1..])?;
+    let (next, keys) = store.scan_keys(ctx.db_index, cursor, pattern.as_deref(), count)?;
+    Ok(scan_reply(next, keys.into_iter().map(RespValue::bulk_string).collect()))
+}
+
+fn hscan_cmd(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error::Result<RespValue> {
+    let cursor = parse_cursor(&args[1])?;
+    let (pattern, _count) = parse_scan_opts(&args[2..])?;
+    let _ = cursor;
+    let (next, pairs) = store.hscan(ctx.db_index, &args[0])?;
+    let mut items = Vec::with_capacity(pairs.len() * 2);
+    for (f, v) in pairs {
+        if pattern.as_deref().map_or(true, |p| crate::store::simple_match(&String::from_utf8_lossy(&f), p)) {
+            items.push(RespValue::bulk_string(f));
+            items.push(RespValue::bulk_string(v));
+        }
+    }
+    Ok(scan_reply(next, items))
+}
+
+fn sscan_cmd(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error::Result<RespValue> {
+    let cursor = parse_cursor(&args[1])?;
+    let (pattern, _count) = parse_scan_opts(&args[2..])?;
+    let _ = cursor;
+    let (next, members) = store.sscan(ctx.db_index, &args[0])?;
+    let items = members.into_iter()
+        .filter(|m| pattern.as_deref().map_or(true, |p| crate::store::simple_match(&String::from_utf8_lossy(m), p)))
+        .map(RespValue::bulk_string)
+        .collect();
+    Ok(scan_reply(next, items))
+}
+
+fn zscan_cmd(store: &Store, ctx: &mut ClientContext, args: &[Vec<u8>]) -> crate::error::Result<RespValue> {
+    let cursor = parse_cursor(&args[1])?;
+    let (pattern, _count) = parse_scan_opts(&args[2..])?;
+    let _ = cursor;
+    let (next, pairs) = store.zscan(ctx.db_index, &args[0])?;
+    let mut items = Vec::with_capacity(pairs.len() * 2);
+    for (m, score) in pairs {
+        if pattern.as_deref().map_or(true, |p| crate::store::simple_match(&String::from_utf8_lossy(&m), p)) {
+            items.push(RespValue::bulk_string(m));
+            items.push(RespValue::bulk_string(format_score(score).into_bytes()));
+        }
+    }
+    Ok(scan_reply(next, items))
+}
+
+/// Formats a score the way Redis does: integers without a decimal point.
+fn format_score(score: f64) -> String {
+    if score == score.trunc() && score.abs() < 1e17 {
+        format!("{}", score as i64)
+    } else {
+        format!("{}", score)
+    }
+}
 
 fn now_ms() -> u64 { SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64 }
 

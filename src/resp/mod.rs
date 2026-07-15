@@ -6,5 +6,5 @@ pub mod serializer;
 pub mod types;
 
 pub use parser::parse_command;
-pub use serializer::serialize_response;
+pub use serializer::{serialize_response, serialize_response_proto};
 pub use types::RespValue;
